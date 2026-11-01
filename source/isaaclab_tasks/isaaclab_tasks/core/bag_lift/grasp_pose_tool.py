@@ -420,6 +420,7 @@ def main(argv: list[str] | None = None) -> int:
     env_cfg.observation_noise_model = None
     env_cfg.episode_length_s = 3600.0
     env_cfg.terminate_on_success = False  # keep going after the bag is lifted (e.g. on to return_home)
+    env_cfg.stagger_first_episodes = False  # one full, repeatable episode
     # Tool only: drive the joints directly. Training uses residual-on-demo; that would fight hand-posed targets.
     env_cfg.use_demo_residual = False
     env_cfg.action_scale = 4.0

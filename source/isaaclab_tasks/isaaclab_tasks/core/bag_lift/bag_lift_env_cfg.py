@@ -110,6 +110,11 @@ class BagLiftEnvCfg(DirectRLEnvCfg):
     # Placeholder: with use_demo_residual the env sets episode_length_s = demo length + episode_extra_s.
     episode_length_s = 30.0
     episode_extra_s = 4.0  # [s] time after the teacher ends to settle into the return_home box
+    # Every env resets at step 0, so without this they all time out on the same step and each PPO rollout
+    # (horizon_length << episode length) holds one slice of the demo: a few epochs of approach, then a few of
+    # grasp, then many of carry, which overwrite each other. True truncates the FIRST episode of each env at a
+    # random length (the teacher still starts at home), which spreads the envs over the whole demo from then on.
+    stagger_first_episodes = True
 
     # --- sizes (MUST match bag_lift_env.py) ----------------------------------
     action_space = 7  # 6 arm joints + gripper
@@ -254,7 +259,10 @@ class BagLiftEnvCfg(DirectRLEnvCfg):
     rew_scale_align = 0.5  # rigid jaw matching the recorded goal orientation
     rew_scale_reached = 0.5  # rigid tip at the pinch target
     rew_scale_close = 1.0  # gripper closing while a jaw is at the strap (leads to the grasp)
-    rew_scale_track = 2.0  # all 7 joints toward the teacher pose this step (zero residual = the demo)
+    # All 7 joints toward the teacher pose this step. Off: it pays for NOT correcting for the bag pose, which is the
+    # whole job of the residual (the demo alone reaches 38% at full randomization). The zero-initialised action head
+    # and rew_scale_residual already keep the policy on the demo. Restore with env.rew_scale_track=2.0.
+    rew_scale_track = 0.0
     rew_scale_grasp = 5.0  # geometric grasp (must beat hovering at the pinch without holding)
     rew_scale_squeeze = 2.0  # gripper closed fraction while grasped
     rew_scale_ee_up = 3.0  # rigid jaw pointing world +Z while grasped (carry the bag with the EE up)
@@ -265,6 +273,9 @@ class BagLiftEnvCfg(DirectRLEnvCfg):
     rew_scale_action_rate = -0.01  # jerky motion
     rew_scale_residual = -0.08  # ||action||^2: stay on the teacher unless the bag draw requires a correction
     rew_scale_time = -2.0  # per second of wall time
+    # One-off when the bag is pushed past bag_out_of_bounds (which ends the episode). Must outweigh the living cost
+    # that ending early saves (|rew_scale_time| * episode length, ~62 at 31 s), else knocking the bag away pays.
+    rew_scale_knocked_away = -100.0
     # One-off on first success, NOT scaled by step_dt. Must beat what staying grasped would still earn: the
     # holding-gated terms total ~28/s and at most ~episode_extra_s remain after the demo, so ~110.
     rew_scale_success = 200.0

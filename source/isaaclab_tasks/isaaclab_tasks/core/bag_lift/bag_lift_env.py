@@ -92,6 +92,9 @@ class BagLiftEnv(DirectRLEnv):
         self._demo_q = self._bake_demo(joint_names)  # (T, 7) teacher joint targets, one per policy step
         self._demo_len = int(self._demo_q.shape[0])
         self._teacher = self._demo_q[0].unsqueeze(0).expand(self.num_envs, -1).clone()
+        # Teacher clock, one per env, zeroed on reset. It is separate from episode_length_buf so the first episodes
+        # can be truncated at random lengths (cfg.stagger_first_episodes) while the demo still starts from home.
+        self._demo_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         if self.cfg.use_demo_residual:
             # max_episode_length is derived from cfg.episode_length_s, so this sets the timeout
             demo_s = self._demo_len * self.step_dt / max(self.cfg.demo_speed, 1e-6)
@@ -174,6 +177,7 @@ class BagLiftEnv(DirectRLEnv):
         # > 0: consecutive raw hits, < 0: consecutive raw misses
         self._grasp_streak = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self._grasped = zeros_b.clone()
+        self._knocked_away = zeros_b.clone()  # bag pushed past cfg.bag_out_of_bounds (ends the episode)
         self._success = zeros_b.clone()  # closed on the strap, bag 5 cm up, at the final pose (10 deg)
         self._first_success = zeros_b.clone()  # rising edge of _success this episode (pays the bonus once)
         self._time_to_success = zeros_f.clone()  # [s] wall time of first success; 0 if it never happened
@@ -187,7 +191,7 @@ class BagLiftEnv(DirectRLEnv):
 
         # Terminal progress line: sums over finished episodes, printed every ~num_envs of them.
         self._win_count = 0
-        self._win_sums = torch.zeros(6, device=self.device)  # reach, grasp, lift, success, at-pose, collision
+        self._win_sums = torch.zeros(7, device=self.device)  # reach, grasp, lift, success, at-pose, collision, knocked
         self._win_tts_sum = 0.0  # time-to-success [s], successes only
         self._win_tts_n = 0
         # multiplies the bag spawn ranges (cfg.rand_curriculum); 1 = full randomization
@@ -540,7 +544,7 @@ class BagLiftEnv(DirectRLEnv):
         self._success = closed_cmd & near_strap & (self._lift_amt > cfg.lift_height) & at_final_pose
         self._first_success = self._success & ~self._ever_success
         self._time_to_success = torch.where(
-            self._first_success, self.episode_length_buf.float() * self.step_dt, self._time_to_success
+            self._first_success, self._demo_step.float() * self.step_dt, self._time_to_success
         )
         self._ever_lifted |= lifted
         self._ever_at_pose |= at_final_pose
@@ -561,7 +565,7 @@ class BagLiftEnv(DirectRLEnv):
         self.actions = actions.clamp(-1.0, 1.0)
         limits = self.arm.data.soft_joint_pos_limits.torch
         if self.cfg.use_demo_residual:
-            idx = (self.episode_length_buf.float() * self.cfg.demo_speed).long().clamp(max=self._demo_len - 1)
+            idx = (self._demo_step.float() * self.cfg.demo_speed).long().clamp(max=self._demo_len - 1)
             self._teacher.copy_(self._demo_q[idx])
             # Over the last residual_fade_frac of the demo, shrink the residual from action_scale (20 deg) to
             # carry_action_scale (4 deg) so the arm can sit inside the 10 deg return_home box but still steer.
@@ -571,6 +575,7 @@ class BagLiftEnv(DirectRLEnv):
             targets = self._teacher + scale.unsqueeze(-1) * self.actions
         else:
             targets = self._joint_targets + self.cfg.action_scale * self.actions
+        self._demo_step += 1
         self._joint_targets = targets.clamp(limits[..., 0], limits[..., 1])
 
     def _apply_action(self) -> None:
@@ -587,7 +592,7 @@ class BagLiftEnv(DirectRLEnv):
         joint_pos_rel = joint_pos - self.arm.data.default_joint_pos.torch
         joint_vel = self.arm.data.joint_vel.torch
         joint_track_err = joint_pos - self._teacher
-        demo_idx = (self.episode_length_buf.float() * self.cfg.demo_speed).clamp(max=self._demo_len - 1)
+        demo_idx = (self._demo_step.float() * self.cfg.demo_speed).clamp(max=self._demo_len - 1)
         phase = (demo_idx / float(max(self._demo_len - 1, 1))).unsqueeze(-1)
         tip_to_target = self._target_pos_w() - self._ee_pos_w()
         bag_pos_w = self.bag.data.root_pos_w.torch
@@ -629,8 +634,8 @@ class BagLiftEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._update_task_state()
         bag_xy = self.bag.data.root_pos_w.torch[:, :2] - self.scene.env_origins[:, :2]
-        knocked_away = torch.norm(bag_xy, dim=-1) > self.cfg.bag_out_of_bounds
-        terminated = (self._success if self.cfg.terminate_on_success else False) | knocked_away
+        self._knocked_away = torch.norm(bag_xy, dim=-1) > self.cfg.bag_out_of_bounds
+        terminated = (self._success if self.cfg.terminate_on_success else False) | self._knocked_away
         time_out = self.episode_length_buf >= self.max_episode_length
         return terminated, time_out
 
@@ -700,7 +705,13 @@ class BagLiftEnv(DirectRLEnv):
         log["Metrics/ee_up"] = rew_ee_up.mean()
         log["Metrics/grasp_raw"] = self._grasp_raw.float().mean()
         log["Metrics/grasped"] = holding.mean()
-        return shaped * self.step_dt + cfg.rew_scale_success * self._first_success.float()
+        # One-off penalty when the bag is knocked away. Without it, ending the episode this way stops the living
+        # cost, so a policy that has drifted off the teacher is paid to push the bag out of bounds.
+        terminal = (
+            cfg.rew_scale_success * self._first_success.float()
+            + cfg.rew_scale_knocked_away * self._knocked_away.float()
+        )
+        return shaped * self.step_dt + terminal
 
     # -------------------------------------------------------------------------
     # RESET: report the rates of the episodes that just ended, then re-randomise them.
@@ -712,6 +723,7 @@ class BagLiftEnv(DirectRLEnv):
         final = self._ever_success[env_ids].float()  # grasped and at the final pose at some point this episode
         at_pose = self._ever_at_pose[env_ids].float()
         collided = self._ever_collided[env_ids].float()
+        knocked = self._knocked_away[env_ids].float()
 
         log = self.extras.setdefault("log", {})  # -> TensorBoard
         log["Metrics/reach_rate"] = reached.mean()
@@ -720,6 +732,7 @@ class BagLiftEnv(DirectRLEnv):
         log["Metrics/final_pose_rate"] = final.mean()
         log["Metrics/at_final_pose_rate"] = at_pose.mean()
         log["Metrics/collision_rate"] = collided.mean()
+        log["Metrics/knocked_away_rate"] = knocked.mean()
         succeeded = self._ever_success[env_ids]
         if succeeded.any():
             log["Metrics/time_to_success_s"] = self._time_to_success[env_ids][succeeded].mean()
@@ -731,19 +744,20 @@ class BagLiftEnv(DirectRLEnv):
             return
         self._win_count += len(env_ids)
         self._win_sums += torch.stack(
-            (reached.sum(), grasp.sum(), lift.sum(), final.sum(), at_pose.sum(), collided.sum())
+            (reached.sum(), grasp.sum(), lift.sum(), final.sum(), at_pose.sum(), collided.sum(), knocked.sum())
         )
         if succeeded.any():
             tts = self._time_to_success[env_ids][succeeded]
             self._win_tts_sum += float(tts.sum())
             self._win_tts_n += int(succeeded.sum())
         if self._win_count >= self.num_envs:
-            reach_r, grasp_r, lift_r, final_r, pose_r, coll_r = (self._win_sums / self._win_count).tolist()
+            reach_r, grasp_r, lift_r, final_r, pose_r, coll_r, knock_r = (self._win_sums / self._win_count).tolist()
             tts_txt = f"{self._win_tts_sum / self._win_tts_n:.1f} s" if self._win_tts_n else "n/a"
             print(
                 f"[BagLift] episodes: {self._win_count:4d} | reach rate: {reach_r:.3f} | "
                 f"grasp rate: {grasp_r:.3f} | lift ({self.cfg.lift_height * 100:.0f} cm) rate: {lift_r:.3f} | "
                 f"final-pose rate: {final_r:.3f} (at pose {pose_r:.3f}) | collision rate: {coll_r:.3f} | "
+                f"knocked away: {knock_r:.3f} | "
                 f"time to success: {tts_txt} | bag randomization: {self._rand_scale:.1f}",
                 flush=True,
             )
@@ -761,6 +775,14 @@ class BagLiftEnv(DirectRLEnv):
         self._report(env_ids)
         super()._reset_idx(env_ids)
         n = len(env_ids)
+        self._demo_step[env_ids] = 0
+        if self.cfg.stagger_first_episodes and int(self.common_step_counter) == 0:
+            # Every env starts at step 0 and would otherwise time out on the same step, so each PPO rollout
+            # (horizon_length << episode length) would hold one slice of the demo only. Truncating the first
+            # episodes at random lengths spreads the envs over the whole demo. The teacher still starts at home.
+            self.episode_length_buf[env_ids] = torch.randint_like(
+                self.episode_length_buf[env_ids], high=max(int(self.max_episode_length), 1)
+            )
 
         # arm: home pose + small jitter
         joint_pos = self.arm.data.default_joint_pos.torch[env_ids].clone()
@@ -810,6 +832,7 @@ class BagLiftEnv(DirectRLEnv):
         self._joint_targets[env_ids] = self.arm.data.default_joint_pos.torch[env_ids]
         self._teacher[env_ids] = self._demo_q[0]
         self._success[env_ids] = False
+        self._knocked_away[env_ids] = False
         self._first_success[env_ids] = False
         self._time_to_success[env_ids] = 0.0
         self._grasped[env_ids] = False

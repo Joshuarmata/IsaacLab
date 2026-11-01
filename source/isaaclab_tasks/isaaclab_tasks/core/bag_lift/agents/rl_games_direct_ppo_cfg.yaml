@@ -67,6 +67,8 @@ params:
     mixed_precision: False
     normalize_input: True
     normalize_value: True
+    # Bootstrap the value on time-outs. Needed for the randomly truncated first episodes (stagger_first_episodes).
+    value_bootstrap: True
     num_actors: -1  # configured from the script (based on num_envs)
     reward_shaper:
       scale_value: 1.0   # env already scales reward by step_dt
@@ -75,13 +77,16 @@ params:
     # (0.99 at 60 Hz was ~1.7 s, so the success bonus at the end of the demo was invisible).
     gamma: 0.997
     tau : 0.97
-    # 3e-4 solved the teacher-residual task (~75% final-pose at epoch 10985) then overwrote it
-    # (reward 136 -> 80); 1e-4 was too slow to recover. 2e-4 with bigger batches for a fresh run.
+    # 3e-4 with a constant LR solved the teacher-residual task (~75% final-pose at epoch 10985) then overwrote it
+    # (reward 136 -> 80). Initial LR for the adaptive schedule below.
     learning_rate: 2e-4
-    # constant: linear decay to 0 over 1000 epochs left the second half of training with a vanishing LR
-    # while reach_rate was still 0. Do NOT use adaptive: it previously froze at ~1e-6 or jumped to 0.01.
-    lr_schedule: constant
-    kl_threshold: 0.08
+    # Adaptive: the LR is cut when an epoch's KL exceeds 2x kl_threshold and raised below 0.5x, which keeps PPO from
+    # overwriting a solved policy. It used to freeze at ~1e-6 because every env reset on the same step: each epoch's
+    # batch was a new slice of the demo and the KL jumped at every slice. stagger_first_episodes fixes that.
+    # 0.01 is the Isaac Lab Franka lift value (Factory: 0.008). Revert with agent.params.config.lr_schedule=constant.
+    lr_schedule: adaptive
+    schedule_type: legacy
+    kl_threshold: 0.01
     score_to_win: 20000
     max_epochs: 4000
     save_best_after: 100
@@ -91,13 +96,14 @@ params:
     entropy_coef: 0.001
     truncate_grads: True
     e_clip: 0.2
-    horizon_length: 64
+    # 128 steps = ~4.3 s of the ~31 s episode per env per epoch (64 was 7% of it).
+    horizon_length: 128
     # rl_games needs (num_envs * horizon_length) % minibatch_size == 0.
-    # 2048 fits 128 envs (8192 steps = 4 minibatches) and 256 envs. For the 4-env smoke test pass
+    # 2048 fits 128 envs (16384 steps = 8 minibatches) and any multiple of 16 envs. For the 4-env smoke test pass
     # `agent.params.config.minibatch_size=256`.
     minibatch_size: 2048
-    # 2 passes x 4 minibatches = 8 gradient steps per epoch. 4 passes started with KL 0.29 and drifted off the demo.
-    mini_epochs: 2
+    # 4 passes x 8 minibatches = 32 gradient steps per epoch; the adaptive LR holds the KL near kl_threshold.
+    mini_epochs: 4
     critic_coef: 4
     clip_value: True
     seq_length: 4

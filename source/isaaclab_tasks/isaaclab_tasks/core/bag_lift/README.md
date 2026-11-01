@@ -43,7 +43,7 @@ Bag spawn randomization follows a curriculum (`rand_curriculum`). The ranges (`b
 
 ```bash
 uv run python scripts/environments/zero_agent.py --task Isaac-BagLift-Direct --num_envs 16 --max_steps 1000 \
-  env.rand_curriculum=true    # nominal pose; env.rand_curriculum=false for full randomization
+  env.stagger_first_episodes=false env.rand_curriculum=true    # nominal pose; rand_curriculum=false: full ranges
 ```
 
 ## Deformable handle (`USE_DEFORMABLE_HANDLE` in `bag_sand_scene.py`)
@@ -78,7 +78,7 @@ reach, align and reached only pay **before** the grasp, so they do not pull the 
 | align | +0.5 | rigid jaw matching the recorded goal orientation (near the target); not while grasped |
 | reached | +0.5 | rigid tip within `reach_radius` (15 mm) of the goal; not while grasped |
 | close | +1.0 | gripper closed fraction, weighted by how close a jaw is to the strap nodes (`1 - tanh(gap / 1 cm)`) |
-| track | +2.0 | all 7 joints toward the `grasp_poses.json` teacher pose this step (`1 - tanh(rms / 0.25)`). Zero residual replays the demo |
+| track | 0 (off) | all 7 joints toward the `grasp_poses.json` teacher pose this step (`1 - tanh(rms / 0.25)`). Off because it pays for not correcting for the bag pose; the zero-initialised action head and `residual` already keep the policy on the demo. `env.rew_scale_track=2.0` restores it |
 | grasp | +5.0 | grasp condition above is true (larger than hovering at the pinch without holding) |
 | squeeze | +2.0 | gripper closed fraction while grasped |
 | ee up | +3.0 | rigid-jaw long axis toward world +Z while grasped (point the EE up before carrying home) |
@@ -89,6 +89,7 @@ reach, align and reached only pay **before** the grasp, so they do not pull the 
 | action rate | -0.01 | jerky residual |
 | residual | -0.08 | `||action||^2`: prefer riding the teacher when the demo already works |
 | time | -2.0 / s | living cost |
+| knocked away | -100 | flat one-off when the bag is pushed past `bag_out_of_bounds` (ends the episode). Larger than the living cost that ending early saves (~62 over 31 s), so knocking the bag away never pays |
 | success | +200 | flat one-off on first success. Larger than what staying grasped would still earn: the holding-gated terms total ~28/s and at most ~4 s remain after the demo (~110) |
 
 Why the ramp: with the full penalty from step 0 the policy learned to stay away from the bag (collision rate
@@ -99,7 +100,7 @@ fell to 0, tip distance grew to 20-30 cm, grasp stayed 0). Watch `Metrics/collis
 One line is printed every time about `num_envs` episodes have finished (rates are over those episodes):
 
 ```
-[BagLift] episodes:  128 | reach rate: 0.250 | grasp rate: 0.164 | lift (5 cm) rate: 0.031 | final-pose rate: 0.008 | collision rate: 0.742 | time to success: 24.1 s | bag randomization: 0.3
+[BagLift] episodes:  128 | reach rate: 0.250 | grasp rate: 0.164 | lift (5 cm) rate: 0.031 | final-pose rate: 0.008 | collision rate: 0.742 | knocked away: 0.016 | time to success: 24.1 s | bag randomization: 0.3
 ```
 
 - `reach rate`: fraction of episodes where the rigid tip got within 15 mm of the pinch target at least once.
@@ -108,10 +109,11 @@ One line is printed every time about `num_envs` episodes have finished (rates ar
 - `final-pose rate`: fraction of episodes that succeeded (see the task table). The terminal line also prints
   `at pose`, the fraction that hit the joint box even if the bag was not held.
 - `collision rate`: fraction of episodes with any penalised bag contact.
+- `knocked away`: fraction of episodes that ended with the bag pushed past `bag_out_of_bounds`.
 - `time to success`: mean seconds from reset to first success, among the episodes in the window that succeeded.
 - `bag randomization`: the curriculum scale on the spawn ranges (0 = nominal pose, 1 = full ranges).
 
-The same values go to TensorBoard as `Metrics/reach_rate`, `Metrics/grasp_rate`, `Metrics/lift_rate`, `Metrics/final_pose_rate`, `Metrics/at_final_pose_rate`, `Metrics/collision_rate`, `Metrics/time_to_success_s`, `Metrics/episode_length_s`, `Metrics/rand_scale`
+The same values go to TensorBoard as `Metrics/reach_rate`, `Metrics/grasp_rate`, `Metrics/lift_rate`, `Metrics/final_pose_rate`, `Metrics/at_final_pose_rate`, `Metrics/collision_rate`, `Metrics/knocked_away_rate`, `Metrics/time_to_success_s`, `Metrics/episode_length_s`, `Metrics/rand_scale`
 (plus `Metrics/grasped`, `Metrics/grasp_raw` (before debouncing), `Metrics/hand_rise`, `Metrics/ee_up`,
 `Metrics/force_jaw_on_body`, `Metrics/force_other_links`, `Metrics/collision_weight`, `Metrics/tip_dist`,
 `Metrics/collision_force`, `Metrics/lift_height`, `Metrics/approach_err_deg`, `Metrics/demo_track_err_deg`).
@@ -149,8 +151,17 @@ uv run tensorboard --logdir logs/rl_games
 ```
 
 PPO (`agents/rl_games_direct_ppo_cfg.yaml`): `gamma` 0.997 and `tau` 0.97 (an ~11 s horizon at 30 Hz, so the success
-bonus at the end of the demo is visible), `horizon_length` 64, `minibatch_size` 2048, `mini_epochs` 4, learning rate
-2e-4. `--num_envs` must satisfy `(num_envs * 64) % 2048 == 0`, so any multiple of 32.
+bonus at the end of the demo is visible), `horizon_length` 128, `minibatch_size` 2048, `mini_epochs` 4, adaptive
+learning rate from 2e-4 with `kl_threshold` 0.01, `value_bootstrap` on. `--num_envs` must satisfy
+`(num_envs * 128) % 2048 == 0`, so any multiple of 16.
+
+**Staggered episodes.** Every env resets at step 0. Without staggering they all time out on the same step, and each
+128-step rollout covers the same slice of the ~930-step demo in every env: a few epochs of approach, a few of grasp,
+then many of carry, each overwriting the last (the cause of the earlier "solved, then forgotten" runs and of the KL
+spikes that froze the adaptive LR). `stagger_first_episodes` (on by default) truncates the first episode of each env
+at a random length, so from then on the envs are spread over the whole demo. The teacher runs on its own per-env
+clock (`_demo_step`), so it still starts from home. Turn it off for repeatable single-episode checks
+(`env.stagger_first_episodes=false`; the pose tool already does).
 Any `BagLiftEnvCfg` value can be overridden with Hydra, e.g. `env.demo_speed=1.2 env.rew_scale_collision=-10.0`.
 
 ## Hand-posed grasp (no learning): `grasp_pose_tool.py`
