@@ -1,0 +1,157 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+# PPO + MLP for Isaac-HandleGrab-Direct. See ../README.md.
+# Constraint: (num_envs * horizon_length) % minibatch_size == 0.
+params:
+  seed: 42
+
+  # environment wrapper clipping
+  env:
+    # added to the wrapper
+    clip_observations: 5.0
+    # can make custom wrapper?
+    clip_actions: 1.0
+    # The picture and the 11 pose numbers have different ranks, so they stay separate.
+    # Joining them in the image would copy the pose onto every pixel and overflow a 16 GB GPU.
+    concate_obs_groups: False
+    obs_groups:
+      obs: ["image", "proprio"]
+      states: ["critic"]
+
+  algo:
+    name: a2c_continuous
+
+  model:
+    name: continuous_a2c_logstd
+
+  # doesn't have this fine grained control but made it close
+  network:
+    name: handle_grab_camera
+    separate: False
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+
+        # Zero action-head weights (biases already start at zero), so a fresh policy outputs a zero residual and
+        # replays the demo. With the default init the first rollouts pushed the arm off the teacher and grasp went
+        # to 0 within 25 epochs.
+        mu_init:
+          name: const_initializer
+          val: 0.0
+        sigma_init:
+          name: const_initializer
+          # log-std = -1.5 => std ≈ 0.22. Residual action_scale 0.35 rad => ~4.5 deg of noise on the teacher.
+          # Larger noise knocks the strap out of the jaws; val 0 previously exploded KL.
+          val: -1.5
+        fixed_sigma: True
+    # The student image is the overhead camera, channels-last RGB then depth. The 11 pose numbers (joint
+    # angles, base in that camera frame, saved strap depth) are concatenated after this convolution,
+    # inside handle_grab_camera.
+    cnn:
+      type: conv2d
+      activation: elu
+      permute_input: True
+      initializer:
+        name: default
+      regularizer:
+        name: None
+      convs:
+        # 160x90 -> 80x45 -> 40x23 -> 20x12
+        - {filters: 32, kernel_size: 4, strides: 2, padding: 1}
+        - {filters: 64, kernel_size: 3, strides: 2, padding: 1}
+        - {filters: 64, kernel_size: 3, strides: 2, padding: 1}
+    mlp:
+      units: [256, 128]
+      activation: elu
+      d2rl: False
+
+      initializer:
+        name: default
+      regularizer:
+        name: None
+
+  load_checkpoint: False # flag which sets whether to load the checkpoint
+  load_path: '' # path to the checkpoint to load
+
+  config:
+    # Camera policy. Logs go to logs/rl_games/handle_grab_camera, separate from the
+    # state-only runs in logs/rl_games/handle_grab.
+    name: handle_grab_camera
+    env_name: rlgpu
+    device: 'cuda:0'
+    device_name: 'cuda:0'
+    multi_gpu: False
+    ppo: True
+    mixed_precision: False
+    # The picture is already 0..1. A running mean over every pixel is a full extra image and washes the color out.
+    normalize_input: False
+    normalize_value: True
+    # Bootstrap the value on time-outs. Needed for the randomly truncated first episodes (stagger_first_episodes).
+    value_bootstrap: True
+    num_actors: -1  # configured from the script (based on num_envs)
+    reward_shaper:
+      scale_value: 1.0   # env already scales reward by step_dt
+    normalize_advantage: True
+    # At 30 Hz, gamma 0.997 is a ~11 s horizon: a reward 20 s away keeps ~16% of its value
+    # (0.99 at 60 Hz was ~1.7 s, so the success bonus at the end of the demo was invisible).
+    gamma: 0.997
+    tau : 0.97
+    # 3e-4 with a constant LR solved the teacher-residual task (~75% final-pose at epoch 10985) then overwrote it
+    # (reward 136 -> 80). Initial LR for the adaptive schedule below.
+    learning_rate: 2e-4
+    # Adaptive: the LR is cut when an epoch's KL exceeds 2x kl_threshold and raised below 0.5x, which keeps PPO from
+    # overwriting a solved policy. It used to freeze at ~1e-6 because every env reset on the same step: each epoch's
+    # batch was a new slice of the demo and the KL jumped at every slice. stagger_first_episodes fixes that.
+    # 0.01 is the Isaac Lab Franka lift value (Factory: 0.008). Revert with agent.params.config.lr_schedule=constant.
+    lr_schedule: adaptive
+    schedule_type: legacy
+    kl_threshold: 0.01
+    score_to_win: 20000
+    max_epochs: 4000
+    save_best_after: 100
+    save_frequency: 25
+    grad_norm: 1.0
+    # 0.002 kept exploring after the peak and knocked the strap out. Fine-tune should sit on the teacher.
+    entropy_coef: 0.001
+    truncate_grads: True
+    e_clip: 0.2
+    # 128 steps = ~4.3 s of the ~31 s episode per env per epoch (64 was 7% of it).
+    horizon_length: 128
+    # rl_games needs (num_envs * horizon_length) % minibatch_size == 0.
+    # 512 keeps the convolution's saved activations small enough that 128 envs fit a 16 GB GPU
+    # (the rollout is stored twice, then this slice is differentiated). 128*128 = 16384 steps = 32 minibatches.
+    # num_envs must be a multiple of 4. A 4-env run is one minibatch.
+    minibatch_size: 512
+    # 4 passes x 32 minibatches = 128 gradient steps per epoch; the adaptive LR holds the KL near kl_threshold.
+    mini_epochs: 4
+    critic_coef: 4
+    clip_value: True
+    seq_length: 4
+    bounds_loss_coef: 0.0001
+
+    # Privileged critic. It sees the arm pose and the bag pose, not the camera.
+    central_value_config:
+      minibatch_size: 512
+      mini_epochs: 4
+      learning_rate: 2e-4
+      lr_schedule: adaptive
+      schedule_type: legacy
+      kl_threshold: 0.01
+      clip_value: True
+      normalize_input: True
+      truncate_grads: True
+      network:
+        name: handle_grab_camera
+        central_value: True
+        mlp:
+          units: [256, 128]
+          activation: elu
+          d2rl: False
+          initializer:
+            name: default
+          regularizer:
+            name: None
