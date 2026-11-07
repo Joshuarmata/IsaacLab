@@ -35,9 +35,13 @@ from isaaclab_physx.sim.schemas import (
     PhysxCollisionCfg,
     PhysxConvexDecompositionCfg,
     PhysxDeformableBodyCfg,
+    PhysxSDFMeshCfg,
     PhysxSurfaceDeformableBodyCfg,
 )
-from isaaclab_physx.sim.spawners.materials import PhysxSurfaceDeformableBodyMaterialCfg
+from isaaclab_physx.sim.spawners.materials import (
+    PhysxDeformableBodyMaterialCfg,
+    PhysxSurfaceDeformableBodyMaterialCfg,
+)
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
@@ -66,6 +70,16 @@ SANDBOX_SPAWN_USD = str(_ASSETS / ("sandbox_particles.usdc" if USE_SAND_PARTICLE
 USE_DEFORMABLE_HANDLE = True
 BAG_SPAWN_USD = str(_ASSETS / ("bag_body_only.usda" if USE_DEFORMABLE_HANDLE else "bag_single_body.usda"))
 HANDLE_SPAWN_USD = str(_ASSETS / "bag_handle_ribbon.usda")
+# Body switch. True = the bag body is a PhysX VOLUME deformable (soft tetrahedral FEM solid) and the strap is clamped to
+# it. False = the body is one rigid body. Needs the file made by assets/build_body_asset.py, and the optional
+# tetrahedralization dependencies, which turn the body surface into the tetrahedral simulation mesh at spawn:
+#     uv sync --inexact --extra tetrahedralization
+# PhysX cannot report contacts on deformables, so with a deformable body there is no arm-vs-bag contact sensor
+# and the collision penalty is 0 (see BagLiftEnv._update_task_state).
+USE_DEFORMABLE_BAG_BODY = True
+if USE_DEFORMABLE_BAG_BODY and not USE_DEFORMABLE_HANDLE:
+    raise ValueError("USE_DEFORMABLE_BAG_BODY needs USE_DEFORMABLE_HANDLE (the strap is clamped to the soft body).")
+BAG_BODY_DEFORMABLE_USD = str(_ASSETS / "bag_body_deformable.usda")
 HANDLE_INFO_JSON = str(_ASSETS / "bag_handle_info.json")  # clamped vertices etc. (build_handle_assets.py)
 JAW_POINTS_JSON = str(_ASSETS / "jaw_points.json")  # proxy points on both jaws, for the geometric grasp test
 ARM_SPAWN_USD = str(_ASSETS / "so101_physics.usda")
@@ -118,11 +132,13 @@ ARM_BASE_POS = (0.0, -0.20, TRAY_WALL_HEIGHT)
 ARM_BASE_ROT = (0.0, 0.0, 1.0, 0.0)  # (x, y, z, w)
 # Grip strength. The gripper motor used to be the same 3 N*m as every other joint: when the jaws stall on the strap
 # the position error saturates it, so it squeezed with ~50 N (3 N*m / ~6 cm jaw lever) although ~2 N is enough to hold
-# a light bag. Over-squeezing a 1 mm shell drives it deep into the jaw colliders, and the pull of the bag then snaps it
-# through. Edit: raise if the bag slips out of the jaws; lower if the strap still pops through the jaw mesh.
+# a light bag. Over-squeezing a 1 mm shell drives it into the jaw mesh, and the pull of the bag then snaps it
+# through. The jaw and strap collision skins below stop the shell short of that mesh. Edit: raise if the bag
+# slips out of the jaws; lower if the strap still pops through.
 GRIPPER_EFFORT_LIMIT = 0.8  # [N*m] ~13 N total pinch
 ARM_JOINT_NAMES = [f"revolute_{i}" for i in range(1, 8)]
 ARM_GRIPPER_JOINT = "revolute_7"
+WRIST_VELOCITY_LIMIT = 2.0  # [rad/s] revolute_4-6 speed limit. Joints 1-3 stay at 0.5.
 # Home pose [rad]: every episode starts here (gripper revolute_7 starts OPEN at 0.6).
 # Edit: change these to move the start/return pose. If the arm cannot reach the bag, raise the
 # shoulder (revolute_2) or unfold the elbow (revolute_3). If it punches the floor, fold it up.
@@ -175,12 +191,31 @@ ARM_CFG = ArticulationCfg(
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False, max_depenetration_velocity=1.0),
         # Tight contact generation so "EE vs bag" means real scrape, not the default ~2 cm PhysX halo.
+        # The jaw links ship as one convexHull each. The hull of the wrist (housing plus the thin paddle)
+        # is a solid block across the mouth, so a strap spawned between the jaws is born inside the
+        # collider and the solver ejects it through the paddle. An SDF of the graphics mesh is solid
+        # exactly where the mesh is, so a node inside a jaw is pushed back to the nearest surface.
         make_uninstanceable=True,
-        collision_props={"/.*": [PhysxCollisionCfg(contact_offset=0.002, rest_offset=0.0)]},
+        collision_props={
+            "/.*": [PhysxCollisionCfg(contact_offset=0.002, rest_offset=0.0)],
+            # Rest plane sits 1.5 mm outside the triangles. With the strap skin the shell stops ~4 mm
+            # short of either jaw, inside the ~1 cm closed mouth.
+            "/.*(wrist_roll_08c|moving_jaw_08d).*": [PhysxCollisionCfg(contact_offset=float(__import__("os").environ.get("A_CONT", 0.006)), rest_offset=float(__import__("os").environ.get("A_REST", 0.0015)))],  # TMPDEBUG
+        },
+        mesh_collision_props={
+            "/.*(Wrist_Roll_08c|Moving_Jaw_08d|STS3215_03a_4).*": [
+                PhysxSDFMeshCfg(
+                    sdf_resolution=128,
+                    sdf_subgrid_resolution=4,
+                    sdf_narrow_band_thickness=0.08,
+                    sdf_margin=0.02,
+                )
+            ]
+        },
         # fix_root_link pins the base to the world (Isaac Lab adds the anchor joint; see assets/so101_physics.usda)
         fix_root_link=True,
         articulation_props=PhysxArticulationCfg(
-            enabled_self_collisions=False, solver_position_iteration_count=8, solver_velocity_iteration_count=0
+            enabled_self_collisions=False, solver_position_iteration_count=16, solver_velocity_iteration_count=1
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(pos=ARM_BASE_POS, rot=ARM_BASE_ROT, joint_pos=ARM_HOME_JOINT_POS),
@@ -190,13 +225,22 @@ ARM_CFG = ArticulationCfg(
         # the arm cannot lift the bag. Split into two ImplicitActuatorCfg entries (arm vs
         # gripper) if you want different gains on revolute_7.
         "arm": ImplicitActuatorCfg(
-            joint_names_expr=["revolute_[1-6]"],
+            joint_names_expr=["revolute_[1-3]"],
             stiffness=20.0,
             damping=1.0,
             joint_effort_limit=3.0,
             # Solver clamp [rad/s]. Stock Isaac Lab SO-101 is 10. Also fills the actuator velocity
             # limit used by the PD model. Edit: raise toward 5-10 for snappier motion.
             joint_velocity_limit=0.5,
+        ),
+        # Wrist pitch / yaw / roll: same gains, a higher speed limit so the jaw can turn faster than the arm moves
+        # (the scoop teacher's scoop_wrist_speed must stay at or under WRIST_VELOCITY_LIMIT).
+        "wrist": ImplicitActuatorCfg(
+            joint_names_expr=["revolute_[4-6]"],
+            stiffness=20.0,
+            damping=1.0,
+            joint_effort_limit=3.0,
+            joint_velocity_limit=WRIST_VELOCITY_LIMIT,
         ),
         # Same gains, but a weaker motor so the pinch cannot crush the strap (see GRIPPER_EFFORT_LIMIT).
         "gripper": ImplicitActuatorCfg(
@@ -239,6 +283,51 @@ BAG_CFG = RigidObjectCfg(
 )
 
 # ===========================================================================
+# BAG BODY (deformable)  (TUNE ME; only used when USE_DEFORMABLE_BAG_BODY = True)
+# The 165 x 89 x 152 mm body (1.76 litres) as a soft FEM solid. It replaces the rigid body of BAG_CFG above. Its
+# mass is BAG_MASS (set on the body, so the density follows from the volume). Stiffness is Young's modulus in Pa:
+#   BODY_YOUNGS_MODULUS    ~1e5 = soft foam, ~1e6 = firm rubber. Too floppy (flattens, sags into the tray):
+#                          raise it. Too stiff to look deformable: lower it.
+#   BODY_POISSONS_RATIO    volume preservation (0.5 = incompressible). Keep below ~0.45 for a stable solve.
+#   BODY_DAMPING           damping against elastic deformation; higher settles faster.
+#   BODY_SOLVER_ITERS      position solver iterations.
+# ===========================================================================
+BODY_YOUNGS_MODULUS = 3.0e5  # [Pa]
+BODY_POISSONS_RATIO = 0.3
+BODY_DAMPING = 0.02
+BODY_SOLVER_ITERS = 32
+BODY_FRICTION = 1.0
+
+if USE_DEFORMABLE_BAG_BODY:
+    BAG_CFG = DeformableObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Bag",
+        # PhysX deformables are copied per env as plain USD (physics replication cannot clone them).
+        cloning_contexts=("isaaclab.cloner:UsdReplicateContext",),
+        init_state=DeformableObjectCfg.InitialStateCfg(pos=(*BAG_SPAWN_XY, BAG_REST_Z), rot=BAG_REST_ROT),
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=BAG_BODY_DEFORMABLE_USD,
+            volume_deformable_props=[
+                OmniPhysicsDeformableBodyCfg(kinematic_enabled=False, mass=BAG_MASS),
+                PhysxDeformableBodyCfg(
+                    solver_position_iteration_count=BODY_SOLVER_ITERS,
+                    enable_speculative_c_c_d=True,
+                    max_depenetration_velocity=0.2,
+                ),
+            ],
+            # Skin on the simulation mesh (jaw side: 1.5 mm; see ARM_CFG).
+            collision_props={"/sim_mesh": [PhysxCollisionCfg(rest_offset=0.001, contact_offset=0.004)]},
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.15, 0.3, 0.7)),
+            physics_material=PhysxDeformableBodyMaterialCfg(
+                youngs_modulus=BODY_YOUNGS_MODULUS,
+                poissons_ratio=BODY_POISSONS_RATIO,
+                elasticity_damping=BODY_DAMPING,
+                static_friction=BODY_FRICTION,
+                dynamic_friction=BODY_FRICTION,
+            ),
+        ),
+    )
+
+# ===========================================================================
 # BAG HANDLE (deformable)  (TUNE ME; only used when USE_DEFORMABLE_HANDLE = True)
 # A 13 x ~120 mm, 1 mm thick strap simulated as a PhysX surface deformable (cloth-like FEM shell). The two feet are
 # clamped to the bag body (see BagLiftEnv._setup_scene). It spawns at the bag's pose, so its mesh is in the bag frame.
@@ -255,12 +344,13 @@ BAG_CFG = RigidObjectCfg(
 #   HANDLE_DAMPING         damping of stretch / bending; higher = settles faster, less ringing.
 #   HANDLE_SOLVER_ITERS    position solver iterations. Stiff thin shells need many (cost grows with it).
 # ===========================================================================
-HANDLE_STIFFNESS = 3.0e9  # [Pa]
+HANDLE_STIFFNESS = float(__import__('os').environ.get('H_STIFF', 3.0e9))  # TMPDEBUG
 HANDLE_BEND_FACTOR = 10.0
 HANDLE_THICKNESS = 0.001  # [m]
 HANDLE_DENSITY = 1000.0  # [kg/m^3] -> the strap weighs ~1.5 g
 HANDLE_DAMPING = 0.2
-HANDLE_SOLVER_ITERS = 64
+HANDLE_SOLVER_ITERS = int(__import__('os').environ.get('H_ITERS', 64))  # TMPDEBUG
+_E = lambda k, d: float(__import__('os').environ.get(k, d))  # TMPDEBUG
 
 HANDLE_CFG = DeformableObjectCfg(
     prim_path="{ENV_REGEX_NS}/Handle",
@@ -271,14 +361,21 @@ HANDLE_CFG = DeformableObjectCfg(
         usd_path=HANDLE_SPAWN_USD,
         surface_deformable_props=[
             OmniPhysicsDeformableBodyCfg(kinematic_enabled=False),
-            PhysxDeformableBodyCfg(solver_position_iteration_count=HANDLE_SOLVER_ITERS, enable_speculative_c_c_d=True),
-            # contact against the jaws is where the strap tunnelled: refresh contact pairs more often and apply the
-            # collision constraints several times per solver iteration (limit: HANDLE_SOLVER_ITERS / 2)
-            PhysxSurfaceDeformableBodyCfg(collision_pair_update_frequency=2, collision_iteration_multiplier=4.0),
+            # A penetrated node is eased back out. A high depenetration speed is what snaps the strap
+            # through the jaw once the shell has deformed past the mesh.
+            PhysxDeformableBodyCfg(
+                solver_position_iteration_count=HANDLE_SOLVER_ITERS,
+                enable_speculative_c_c_d=True,
+                max_depenetration_velocity=_E('H_DEPEN', 0.2),  # TMPDEBUG
+                **({k: _E(e, 0) for k, e in (("settling_damping", "H_SETTLE"), ("sleep_threshold", "H_SLEEP"), ("linear_damping", "H_LDAMP"), ("max_linear_velocity", "H_MAXV"), ("settling_threshold", "H_SETTHR")) if __import__("os").environ.get(e) is not None}),  # TMPDEBUG
+            ),
+            # Refresh jaw contacts every solver iteration and spend more of those iterations on collision.
+            PhysxSurfaceDeformableBodyCfg(collision_pair_update_frequency=1, collision_iteration_multiplier=_E('H_CIM', 8.0))  # TMPDEBUG,
         ],
-        # collision offsets ride on the simulation mesh the spawner creates under the Handle prim. A larger rest
-        # offset keeps the 1 mm shell this far off the jaw surface, so it is harder to push through.
-        collision_props={"/sim_mesh": [PhysxCollisionCfg(rest_offset=0.001, contact_offset=0.005)]},
+        # Skin on the simulation mesh. rest_offset is the gap the shell keeps from the jaw; contact_offset
+        # must be larger so the contact exists before the shell reaches that gap. Together with the jaw
+        # skin (1.5 mm) each side rests 4 mm outside the mesh, which still fits the ~1 cm closed mouth.
+        collision_props={"/sim_mesh": [PhysxCollisionCfg(rest_offset=_E("H_REST", 0.0025), contact_offset=_E("H_CONT", 0.008))]},  # TMPDEBUG
         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.08, 0.08, 0.1)),
         physics_material=PhysxSurfaceDeformableBodyMaterialCfg(
             density=HANDLE_DENSITY,

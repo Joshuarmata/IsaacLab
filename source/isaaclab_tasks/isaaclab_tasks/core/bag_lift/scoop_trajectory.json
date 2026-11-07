@@ -1,0 +1,25 @@
+{
+  "_comment": [
+    "Teacher trajectory for Isaac-BagScoopLift-Direct. Edit this file, then rerun the test command. No code change needed.",
+    "Every waypoint is an ABSOLUTE target measured from the spawned grasp (the tip position and jaw angle at step 0), not an increment on the previous waypoint. Waypoints run in order, 1 then 2 then 3, and each move starts from the pose the arm actually reached at the end of the previous one.",
+    "",
+    "TOP-LEVEL INPUTS",
+    "hold_s: seconds to hold the final pose after the last waypoint, before the episode times out.",
+    "waypoints: ordered list of moves. Each one is numbered and named by the action it performs.",
+    "",
+    "WAYPOINT INPUTS",
+    "name: label for the action, written '<number>. <action>'. Only used for printouts and error messages.",
+    "away_cm: horizontal displacement of the jaw tip from its spawned position, in cm, along the 'away' direction. 'Away' is the bag's +Z axis (from the bag body toward the strap) flattened onto the ground plane, so it is always horizontal. Positive moves the tip farther from the bag body, negative moves it back toward the bag body, 0 keeps the spawned horizontal position. Same sign in every env.",
+    "up_cm: vertical displacement of the jaw tip from its spawned position, in cm, along world +Z. Positive lifts, negative lowers, 0 keeps the spawned height.",
+    "jaw_deg: jaw elevation in degrees above the horizontal 'away' direction. -90 = pointing straight down, 0 = parallel to the ground, +90 = straight up. null keeps the angle of the previous waypoint (for the first waypoint, the spawned grasp angle, printed on the first reset).",
+    "seconds: time allotted for this move. It is stretched automatically if a joint would exceed scoop_joint_speed (joints 1-3, 0.4 rad/s) or scoop_wrist_speed (wrist joints 4-6, 1.5 rad/s).",
+    "knots: how many straight-line IK steps this move is cut into. More knots follow the straight line between waypoints more closely.",
+    "rotate_frac: the jaw finishes its rotation within this fraction of the move (0.5 = twice as fast as spreading it over the whole move, 1.0 = same pace as the translation) while the tip keeps moving for the whole move. Values are clamped to 0.05-1.0."
+  ],
+  "hold_s": 2.0,
+  "waypoints": [
+    {"name": "1. take up the slack", "away_cm": 2.0, "up_cm": 10.0, "jaw_deg": 20.0, "seconds": 4.0, "knots": 4, "rotate_frac": 0.5},
+    {"name": "2. lift clear and start turning the jaw up", "away_cm": 0.0, "up_cm": 25.0, "jaw_deg": 45.0, "seconds": 4.0, "knots": 4, "rotate_frac": 0.5},
+    {"name": "3. carry up and finish turning", "away_cm": 0.0, "up_cm": 20.0, "jaw_deg": 70.0, "seconds": 2.0, "knots": 4, "rotate_frac": 0.5}
+  ]
+}

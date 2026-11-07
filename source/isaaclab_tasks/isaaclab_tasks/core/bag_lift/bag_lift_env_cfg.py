@@ -49,6 +49,7 @@ from .bag_sand_scene import (
     JAW_POINTS_JSON,
     MOVING_JAW_BODY_NAME,
     SANDBOX_CFG,
+    USE_DEFORMABLE_BAG_BODY,
     USE_DEFORMABLE_HANDLE,
     USE_SAND_PARTICLES,
 )
@@ -65,8 +66,10 @@ else:
 class BagLiftSceneCfg(InteractiveSceneCfg):
     sandbox = SANDBOX_CFG  # plain rigid tray
     arm = ARM_CFG  # SO-101, physics layer switched on
-    bag = BAG_CFG  # bag merged into one rigid body
-    contact: ContactSensorCfg = ARM_CONTACT_CFG  # every arm link vs the bag
+    bag = BAG_CFG  # bag body: a volume deformable (USE_DEFORMABLE_BAG_BODY) or one rigid body
+    if not USE_DEFORMABLE_BAG_BODY:
+        # PhysX cannot report contacts on deformables, so the arm-vs-bag sensor only exists for the rigid bag.
+        contact: ContactSensorCfg = ARM_CONTACT_CFG  # every arm link vs the bag
     ambient = AMBIENT_LIGHT_CFG  # one dim dome light
 
     def __post_init__(self):
@@ -78,17 +81,18 @@ class BagLiftSceneCfg(InteractiveSceneCfg):
 @configclass
 class EventCfg:
     # Bag grip and servo stiffness are re-drawn every reset. Set a range to a single value to freeze it.
-    bag_friction = EventTerm(
-        func=mdp.randomize_rigid_body_material,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("bag", body_names=".*"),
-            "static_friction_range": (0.5, 1.2),
-            "dynamic_friction_range": (0.4, 1.0),
-            "restitution_range": (0.0, 0.1),
-            "num_buckets": 64,
-        },
-    )
+    if not USE_DEFORMABLE_BAG_BODY:  # the deformable body's friction is its material (bag_sand_scene.py)
+        bag_friction = EventTerm(
+            func=mdp.randomize_rigid_body_material,
+            mode="reset",
+            params={
+                "asset_cfg": SceneEntityCfg("bag", body_names=".*"),
+                "static_friction_range": (0.5, 1.2),
+                "dynamic_friction_range": (0.4, 1.0),
+                "restitution_range": (0.0, 0.1),
+                "num_buckets": 64,
+            },
+        )
     arm_gains = EventTerm(
         func=mdp.randomize_actuator_gains,
         mode="reset",
@@ -157,6 +161,42 @@ class BagLiftEnvCfg(DirectRLEnvCfg):
     residual_fade_frac = 0.25
     carry_action_scale = 0.07  # [rad] ~4 deg, under final_pose_tol so it cannot push the arm out of the box
     demo_speed = 1.0  # teacher playback: 1 = grasp_poses.json timing; >1 finishes the demo earlier (speed ceiling)
+    # Last waypoint included in the teacher. None plays the whole sequence in grasp_poses.json.
+    demo_stop_waypoint: str | None = None
+    # Pose the teacher starts from. None starts at the home pose and includes the first move. When set, the
+    # teacher holds that pose, then plays the waypoints after it through demo_stop_waypoint.
+    demo_start_waypoint: str | None = None
+    # Arm joints written on reset. None keeps the USD home pose.
+    reset_pose_waypoint: str | None = None
+    # Place the closed gripper on this bag's strap at reset (bag frame, so it follows the bag pose). The arm
+    # appears already shut: no approach and no closing motion. Off for the grasp-handle and full-lift tasks.
+    spawn_closed_grasp = False
+    # Keep the gripper joint at gripper_closed_pos. The policy's 6 arm joints still move. Off unless a policy
+    # starts already shut and should not be able to open the jaw.
+    hold_gripper_closed = False
+    # Success is the bag lift_height up while the grip is still true, with no return-home pose. The full task
+    # leaves this off and still requires return_home.
+    success_is_lift = False
+    spawn_press = 0.0  # [m] extra push of the closed jaws into the strap. 0 leaves them on the strap as solved.
+    strap_half_width = 0.0065  # [m] half the strap width along bag +Y
+    strap_apex = (0.0, 0.0, 0.11375)  # [m] top of the strap arch, bag frame
+    # --- scoop teacher (Cartesian waypoints in the vertical plane through the strap) ------------------------------
+    # Needs spawn_closed_grasp: the teacher starts from the closed grasp on the strap and is solved by IK per bag.
+    # The waypoints live in scoop_trajectory.json (edit that file, not this one). "away" is the horizontal direction
+    # from the bag body toward the strap, "up" is world +Z, and jaw elevation is -90 deg pointing down, 0 deg
+    # parallel to the ground, +90 deg straight up.
+    scoop_teacher = False
+    scoop_trajectory_file = str(Path(__file__).parent / "scoop_trajectory.json")
+    scoop_joint_speed = 0.40  # [rad/s] speed cap for the arm joints 1-3 along the path (their motors cap at 0.5)
+    # Speed cap for the wrist joints 4-6, which turn the jaw. Higher than the arm's so the rotation is quick.
+    # Must be <= bag_sand_scene.WRIST_VELOCITY_LIMIT, the wrist motors' own limit.
+    scoop_wrist_speed = 1.5  # [rad/s]
+    # Pull of each teacher IK knot toward the previous knot's joints. Any pull stalls the IK near the almost-singular
+    # wrist of the spawned grasp, leaving cm-sized tip errors, so it is off.
+    scoop_posture_weight = 0.0
+    scoop_ik_warn_mm = 4.0  # [mm] warn when the IK misses the wrist position by more than this
+    scoop_ik_warn_deg = 3.0  # [deg] warn when the IK misses the wrist orientation by more than this
+    ee_up_success = 0.985  # jaw axis · world +Z. 0.985 is about 10 deg off straight up.
     arm_joint_noise = 0.05  # [rad] start-pose jitter
 
     # --- handle geometry (bag frame) -------------------------------------------
@@ -187,9 +227,9 @@ class BagLiftEnvCfg(DirectRLEnvCfg):
     # PhysX cannot report contacts on deformables, so the grasp is inferred from geometry (no forces):
     #   1. the gripper is commanded closed (target within grip_closed_margin of its closed limit)
     #   2. EITHER (preferred) >= min_strap_nodes strap nodes REST on the rigid jaw (within pinch_dist of its proxy
-    #      points in assets/jaw_points.json, on the mouth side) at depth < mouth_mid_frac + mouth_tol, i.e. midway or
-    #      further back; OR >= min_strap_nodes nodes lie BETWEEN the jaws (within pinch_dist of both, on opposite
-    #      sides) at depth mouth_mid_frac +- mouth_tol.
+    #      points in assets/jaw_points.json, either face of the paddle) at depth < mouth_mid_frac + mouth_tol, i.e.
+    #      midway or further back; OR >= min_strap_nodes nodes lie BETWEEN the jaws (within pinch_dist of both, on
+    #      opposite sides) at depth mouth_mid_frac +- mouth_tol.
     #   Depth: 0 = housing end (mouth_base_y), 1 = jaw tip (mouth_tip_y), in the rigid-jaw link frame (-Y is the
     #   jaw's long axis).
     handle_info_file = HANDLE_INFO_JSON
@@ -252,6 +292,11 @@ class BagLiftEnvCfg(DirectRLEnvCfg):
     rand_scale_init = 0.0
     rand_scale_step = 0.1
     rand_curriculum_success = 0.8
+
+    # Terminal line. "full" prints every stage. "grasp" prints grasp rate and the lower-body collision rate.
+    # report_name is the tag in that line, so each policy folder can name its own runs.
+    report_name = "BagLift"
+    report_focus = "full"
 
     # --- reward weights (per-step terms are multiplied by step_dt; success is a one-off) ----------
     # reach / align / reached only pay before the grasp, so they do not pull the hand back down during the carry

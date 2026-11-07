@@ -172,7 +172,7 @@ class GraspRig:
     def _record(self) -> None:
         """Append the state after this control step to the trajectory log."""
         u = self.u
-        bag_p, bag_q = u.bag.data.root_pos_w.torch[0:1], u.bag.data.root_quat_w.torch[0:1]
+        bag_p, bag_q = (x[0:1] for x in u._bag_pose())
         tip = quat_apply_inverse(bag_q, u._ee_pos_w()[0:1] - bag_p)[0]
         self.log.append(
             {
@@ -211,8 +211,9 @@ class GraspRig:
     def status(self, label: str) -> dict:
         u = self.u
         tip = u._ee_pos_w()[0]
-        bag_pos = u.bag.data.root_pos_w.torch[0]
-        rel = quat_apply_inverse(u.bag.data.root_quat_w.torch[0:1], (tip - bag_pos).unsqueeze(0))[0]
+        bag_pos_all, bag_quat_all = u._bag_pose()
+        bag_pos = bag_pos_all[0]
+        rel = quat_apply_inverse(bag_quat_all[0:1], (tip - bag_pos).unsqueeze(0))[0]
         info = {
             "lift_cm": 100.0 * float(u._lift_amt[0]),
             "grasped": bool(u._grasped[0]),
@@ -284,8 +285,7 @@ def _record_goal(rig: GraspRig, poses: dict, args: argparse.Namespace) -> None:
     _run_sequence(rig, poses, args)
     rig.hold(1.0)  # let the arm settle
     info = rig.status(f"record:{shown}")
-    bag_p = u.bag.data.root_pos_w.torch[0:1]
-    bag_q = u.bag.data.root_quat_w.torch[0:1]
+    bag_p, bag_q = (x[0:1] for x in u._bag_pose())
     tip = quat_apply_inverse(bag_q, u._ee_pos_w()[0:1] - bag_p)[0]
     jaw_q = quat_mul(quat_conjugate(bag_q), u.arm.data.body_quat_w.torch[0:1, u._ee_idx])[0]
     moving_idx = u.arm.find_bodies(u.cfg.moving_jaw_body_name)[0][0]

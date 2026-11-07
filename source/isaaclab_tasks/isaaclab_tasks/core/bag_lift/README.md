@@ -133,6 +133,69 @@ last actions (7), tip in the bag frame (3), and the grasp state (5): rigid and m
 10 cm), grasped, bag lift, gripper closed fraction. The strap gaps only exist in simulation, so this is a teacher
 policy; a real-arm policy would need a student trained on camera views.
 
+## Soft bag body (`USE_DEFORMABLE_BAG_BODY` in `bag_sand_scene.py`)
+
+`True` (default): the bag body is a PhysX **volume deformable** (tetrahedral FEM) built from the bag mesh by
+`assets/build_body_asset.py` (`assets/bag_body_deformable.usda`, 1928 vertices, watertight). Needs the optional
+tetrahedralizer: `uv sync --inexact --extra tetrahedralization`. The strap must be deformable too. `False` restores the
+rigid body (one-line revert), which is also the way to test the teacher alone.
+
+- A soft body has no root pose. `BagLiftEnv._bag_pose()` fits the rest nodes to the current nodes (Kabsch / SVD) and
+  everything that used the root pose (target, observations, lift height, knocked-away test) uses that fit.
+- The strap feet are pinned into the body's tetrahedra with `OmniPhysicsVtxTetAttachment` (stiffness inf) in
+  `BagLiftEnv._author_handle_attachment`. Barycentric coordinates come from PhysX's own tet finder when available.
+- PhysX cannot report contacts on deformables, so there is no contact sensor and the collision penalty is 0.
+- Material and solver numbers are in `bag_sand_scene.py`, "BAG BODY (deformable)": `BODY_YOUNGS_MODULUS`,
+  `BODY_POISSONS_RATIO`, `BODY_DAMPING`, `BODY_SOLVER_ITERS`, `BODY_FRICTION`.
+- Not verified on hardware yet: that the body tetrahedralizes, the strap clamp convention, and the sim speed.
+
+## Scoop teacher (`scoop_trajectory.json`)
+
+The teacher is a list of Cartesian waypoints in `scoop_trajectory.json` (next to `bag_lift_env.py`). Edit that file and
+rerun the test command; no code change is needed. Each waypoint is an absolute target measured from the spawned grasp:
+
+| Field | Meaning |
+|---|---|
+| `away_cm` | horizontal, from the bag body toward the strap (negative = toward the bag body) |
+| `up_cm` | world +Z (negative = down) |
+| `jaw_deg` | jaw elevation above the horizontal `away` direction: -90 pointing down, 0 parallel to the ground, +90 straight up. `null` keeps the previous angle |
+| `seconds` | time for the move (stretched if a joint would exceed `scoop_joint_speed`) |
+| `knots` | number of straight IK steps the move is cut into |
+| `rotate_frac` | the jaw finishes its rotation in this fraction of the move (0.5 = twice as fast as the lift pace); the tip keeps rising the whole move. Default 1.0 |
+
+Joints 1-3 are capped at `scoop_joint_speed` (0.4 rad/s); the wrist joints 4-6 that turn the jaw at `scoop_wrist_speed` (1.5 rad/s), with their own motor limit `WRIST_VELOCITY_LIMIT` (2.0 rad/s) in `bag_sand_scene.py`. `hold_s` is how long the last pose is held. The tracked point is the rigid-jaw tip. Joint targets are linear between IK
+knots. On the first reset the env prints the spawned jaw angle and, per waypoint, how far the tip really moved, the jaw
+angle reached, and the worst IK miss. A `<--` mark means the arm cannot reach that waypoint exactly, so back the move
+off. Default: take up the slack (1.5 cm, jaw unchanged), lift to 6 cm while the jaw turns from the grasp (about -90) to -60,
+then carry up to 12 cm while it finishes at -20, each turn done in the first half of its move. The printout also gives
+the peak arm and wrist joint speeds per waypoint.
+
+## Policies
+
+Each policy is its own folder under `policies/`. Shared grasp, collision, and scene code stays in `bag_lift_env.py`.
+A new policy is another folder beside `grasp_handle/` with its own gym id, reward weights, and log directory.
+
+| Policy | Task id | Task | Logs |
+|---|---|---|---|
+| grasp handle | `Isaac-BagGraspHandle-Direct` | Bag spawns at the nominal pose every reset. Reward is the debounced grasp (weight +5 while it holds) and the collision penalty on the lower 95% of the bag body (weight -0.5, same ramp). Teacher plays `grasp_poses.json` through `grasp_closed`, then holds. | `logs/rl_games/bag_grasp_handle/` |
+| scoop lift | `Isaac-BagScoopLift-Direct` | Soft bag, same spot every reset. The closed gripper starts on the strap and a Cartesian waypoint teacher (`scoop_trajectory.json`) picks the bag up. Zero action replays the teacher; the policy learns a small residual (`action_scale` 0.05 rad). Reward: grasp, squeeze, jaw pointing up, hand and bag rise, +50 at a 5 cm lift. | `logs/rl_games/bag_scoop_lift/` |
+
+```bash
+uv run --extra rl-games isaaclab train --rl_library rl_games --task=Isaac-BagGraspHandle-Direct --num_envs 128
+```
+
+The terminal line for this policy is grasp rate, collision rate, and time to grasp.
+
+```bash
+# test the teacher first: zero actions, one env, Isaac Sim window (about 10 s per episode, 30 Hz)
+uv run python scripts/environments/zero_agent.py --task Isaac-BagScoopLift-Direct --num_envs 1 --viz kit --max_steps 900
+
+# train (16 envs: the soft bodies are expensive; 128 steps x 16 envs = the 2048 minibatch)
+uv run --extra rl-games isaaclab train --rl_library rl_games --task=Isaac-BagScoopLift-Direct --num_envs 16
+```
+
+The scoop terminal line is held rate (grip still true at the end), dropped, lift rate, and how far the jaw pointed up.
+
 ## Commands (from the Isaac Lab repo root)
 
 ```bash
@@ -220,7 +283,9 @@ bag_lift/
 ├── bag_sand_scene.py                    arm, bag, tray, contact sensor, light (physical constants)
 ├── bag_lift_env_cfg.py                  every number: rewards, success thresholds, randomization
 ├── bag_lift_env.py                      logic: task state, rewards, dones, reset, metrics
-├── agents/rl_games_direct_ppo_cfg.yaml  PPO + MLP [256, 128]
+├── agents/rl_games_direct_ppo_cfg.yaml  PPO + MLP [256, 128] for the full lift task
+├── policies/grasp_handle/               grasp-handle policy: fixed bag pose, grasp + lower-95% collision
+├── policies/scoop_lift/                 scoop-lift policy: soft bag, start in the grasp, waypoint teacher from scoop_trajectory.json
 └── assets/                              USD wrappers (arm, bag, bag body only, strap ribbon, tray), the generated
                                          bag_handle_info.json / jaw_points.json, and the build scripts
 ```
