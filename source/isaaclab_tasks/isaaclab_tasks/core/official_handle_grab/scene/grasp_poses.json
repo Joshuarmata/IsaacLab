@@ -1,5 +1,10 @@
 {
-  "_comment": "Joint angles in DEGREES. A waypoint lists only the joints it changes; the rest are inherited from the previous waypoint (the first inherits the home pose). 'show' picks the waypoint held in live mode. Speeds stay <= 19 deg/s: the smoothstep peaks at 1.5x, under the 28.6 deg/s motor cap.",
+  "_comment": "Joint angles in DEGREES. A waypoint lists only the joints it changes; the rest are inherited from the previous waypoint (the first inherits the home pose). 'show' picks the waypoint held in live mode and written by --record.",
+  "_how_training_uses_each_pose": {
+    "pregrasp": "Recording only. --record plays home -> pregrasp -> grasp, so this is the clear path in. Training never reads it: the reset generator makes its own pregrasp, 6 cm back along the jaw from the recorded grasp.",
+    "grasp": "The one pose training uses. --record turns it into grasp_goal.json: the rigid-jaw tip position and jaw orientation in the bag frame. The reset generator solves IK to that target at every bag position (approaching with the jaw open, then closing it itself), and the approach reward pays the tip for nearing that point. These joint angles only seed the IK. The tip is on the rigid jaw, so the gripper angle does not move the target; it is closed here so B5 can check the closed jaw holds the strap (3+ nodes resting on the rigid jaw or pinched, readout 'OK').",
+    "return_home": "Not used by training. The pose tool runs Isaac-HandleGrab-Direct, which will not start without it. Keep it at the home pose."
+  },
   "_home": {
     "revolute_1": 6.3,
     "revolute_2": 53.9,
@@ -9,62 +14,48 @@
     "revolute_6": -21.2,
     "revolute_7": 34.4
   },
-  "show": "grasp_closed",
-  "sequence": ["pregrasp", "grasp", "grasp_closed", "lift", "ee_up", "return_home"],
+  "show": "return_home",
+  "sequence": ["pregrasp", "grasp", "return_home"],
+  "_speed_note": "Per joint, per waypoint: how fast each joint moves INTO that waypoint [deg/s]. Each joint finishes on its own schedule, then waits for the slowest. Peak is 1.5x the number; the motor cap is 286.5 deg/s, but slow moves keep the strap contact gentle. Used by --record and --mode run only; live mode and training ignore them.",
   "speed_deg_per_s": {
-    "pregrasp": {"default": 19},
-    "grasp": {"default": 19},
-    "grasp_closed": {"default": 19},
-    "lift": {"default": 12},
-    "ee_up": {"default": 12},
-    "return_home": {"default": 15}
+    "pregrasp": {
+      "revolute_1": 6, "revolute_2": 6, "revolute_3": 6, "revolute_4": 6,
+      "revolute_5": 6, "revolute_6": 19, "revolute_7": 19
+    },
+    "grasp": {
+      "revolute_1": 19, "revolute_2": 19, "revolute_3": 19, "revolute_4": 19,
+      "revolute_5": 19, "revolute_6": 19, "revolute_7": 19
+    },
+    "return_home": {
+      "revolute_1": 15, "revolute_2": 15, "revolute_3": 15, "revolute_4": 15,
+      "revolute_5": 15, "revolute_6": 15, "revolute_7": 15
+    }
   },
   "pregrasp": {
-    "revolute_1": 6.3,
-    "revolute_2": 53.9,
-    "revolute_3": -124.3,
-    "revolute_4": 40.7,
-    "revolute_5": -5.2,
-    "revolute_6": -21.2,
-    "revolute_7": 0.4
+    "revolute_1": -1.6,
+    "revolute_2": 133.9,
+    "revolute_3": -92.1,
+    "revolute_4": 26.2,
+    "revolute_5": -2.1,
+    "revolute_6": -118.3,
+    "revolute_7": 34.4
   },
   "grasp": {
-    "revolute_1": -10.3,
-    "revolute_2": 142.9,
-    "revolute_3": -112.3,
-    "revolute_4": 39.7,
-    "revolute_5": -0.2,
-    "revolute_6": -128.2,
-    "revolute_7": -0.4
-  },
-  "grasp_closed": {
-    "revolute_1": -10.3,
-    "revolute_2": 123.9,
-    "revolute_3": -75.3,
-    "revolute_4": -0.7,
-    "revolute_5": -0.5,
-    "revolute_6": -148.2,
-    "revolute_7": -30.4
-  },
-  "lift": {
-    "revolute_1": -10.3,
-    "revolute_2": 118.9,
-    "revolute_3": -70.3,
-    "revolute_4": -70.7,
-    "revolute_5": -0.2,
-    "revolute_6": -138.2,
-    "revolute_7": -30.4
-  },
-  "ee_up": {
-    "revolute_4": -120.7
+    "revolute_1": -1.6,
+    "revolute_2": 133.9,
+    "revolute_3": -92.1,
+    "revolute_4": 26.2,
+    "revolute_5": -2.1,
+    "revolute_6": -118.3,
+    "revolute_7": -20.4
   },
   "return_home": {
-    "revolute_1": -10.3,
-    "revolute_2": 10.9,
-    "revolute_3": -0.3,
-    "revolute_4": -120.7,
-    "revolute_5": -5.2,
-    "revolute_6": -138.2,
-    "revolute_7": -30.4
+    "revolute_1": 6.3,
+    "revolute_2": -0.9,
+    "revolute_3": -8.3,
+    "revolute_4": -110.0,
+    "revolute_5": -2.2,
+    "revolute_6": -121.2,
+    "revolute_7": -20.4
   }
 }

@@ -40,7 +40,7 @@ SANDBOX_SPAWN_USD = str(SANDBOX_USD)
 # Handle switch. True = the strap is a bendable PhysX surface deformable clamped to a body-only rigid bag (stiff enough
 # to hold its arch under gravity, but yields when the jaws press it). False = the original fully rigid bag (body + strap
 # as one rigid body, bag_single_body.usda). Needs the files made by assets/build_handle_assets.py.
-USE_DEFORMABLE_HANDLE = False
+USE_DEFORMABLE_HANDLE = True
 BAG_SPAWN_USD = str(BAG_BODY_USD if USE_DEFORMABLE_HANDLE else BAG_USD)
 HANDLE_SPAWN_USD = str(HANDLE_USD)
 HANDLE_INFO_JSON = str(HANDLE_INFO)  # clamped vertices etc. (build_handle_assets.py)
@@ -130,14 +130,15 @@ BASE_BODY_NAME = "base_08q"
 # SO_101_sim.usd is a 7-joint chain. Joint names are the prim names the URDF converter gave them:
 #   revolute_1 base pan      revolute_2 shoulder lift   revolute_3 elbow       revolute_4 wrist pitch
 #   revolute_5 wrist yaw     revolute_6 wrist roll      revolute_7 gripper jaw
-# The CAD arm is Y-up. so101_physics.usda stands it up with a 90 deg roll about X on /Arm/Mount
-# (CAD +Y becomes world +Z). Isaac Lab writes init_state.rot onto /Arm, the parent of Mount, so this
-# quaternion is the 180 deg yaw that turns the upright arm toward the bag.
+# The CAD arm is Y-up. Standing it up takes a 90 deg roll about X, then a 180 deg yaw so it faces the bag.
+# Isaac Lab writes init_state.rot onto the articulation root and does not keep a roll stored on /Arm/Mount,
+# so both rotations are in this quaternion. Yaw alone leaves the arm on its side: the recorded joints then
+# put the tip near (-0.001, -0.166, 0.312) instead of on the strap.
 # ===========================================================================
 TRAY_WALL_HEIGHT = 0.06  # [m] tray walls span z = 0 .. 0.06 (see assets/sandbox_tray.usda)
 # The base sits on top of the wall height so the arm clears the south wall (y = -0.125) in front of it.
 ARM_BASE_POS = (0.0, -0.20, TRAY_WALL_HEIGHT)
-ARM_BASE_ROT = (0.0, 0.0, 1.0, 0.0)  # (x, y, z, w) 180 deg yaw
+ARM_BASE_ROT = (0.0, 0.70710678, 0.70710678, 0.0)  # (x, y, z, w) 90 deg roll about X, then 180 deg yaw
 # Grip strength. The gripper motor used to be the same 3 N*m as every other joint: when the jaws stall on the strap
 # the position error saturates it, so it squeezed with ~50 N (3 N*m / ~6 cm jaw lever) although ~2 N is enough to hold
 # a light bag. Over-squeezing a 1 mm shell drives it into the jaw mesh, and the pull of the bag then snaps it
@@ -196,7 +197,10 @@ ARM_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=ARM_SPAWN_USD,
         activate_contact_sensors=True,
-        rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=False, max_depenetration_velocity=1.0),
+        # No gravity on the arm links, like SO101_HIGH_PD_CFG. The relative action commands at most
+        # stiffness * 0.033 rad = 0.66 N*m, too little to hold the arm up (home sagged 46 deg in 2 s with gravity).
+        # The bag keeps gravity, so lifting it still loads the drives.
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(disable_gravity=True, max_depenetration_velocity=1.0),
         # Tight contact generation so "EE vs bag" means real scrape, not the default ~2 cm PhysX halo.
         # The jaw links ship as one convexHull each. The hull of the wrist (housing plus the thin paddle)
         # is a solid block across the mouth, so the strap cannot sit between the jaws. A few convex pieces
@@ -240,9 +244,10 @@ ARM_CFG = ArticulationCfg(
             stiffness=20.0,
             damping=1.0,
             joint_effort_limit=3.0,
-            # Solver clamp [rad/s]. Stock Isaac Lab SO-101 is 10. Also fills the actuator velocity
-            # limit used by the PD model. Edit: raise toward 5-10 for snappier motion.
-            joint_velocity_limit=0.5,
+            # Solver clamp [rad/s]. Stock Isaac Lab SO-101 is 10. Keep it above effort / damping (3 rad/s): a
+            # saturated drive heads for that speed, and a lower cap jams a joint under gravity load (at 0.5 or 1,
+            # revolute_4 stuck at its +52 deg stop on the way to -40 deg). Commanded targets set the actual speed.
+            joint_velocity_limit=5.0,
         ),
         # Same gains, but a weaker motor so the pinch cannot crush the strap (see GRIPPER_EFFORT_LIMIT).
         "gripper": ImplicitActuatorCfg(
@@ -288,8 +293,8 @@ BAG_CFG = RigidObjectCfg(
 # ===========================================================================
 # BAG HANDLE (deformable)  (TUNE ME; only used when USE_DEFORMABLE_HANDLE = True)
 # A 13 x ~120 mm, 1 mm thick strap simulated as a PhysX surface deformable (cloth-like FEM shell). The two feet
-# are clamped to the bag body (see HandleGrabEnv._setup_scene). It spawns at the bag's pose, so its mesh is in
-# the bag frame.
+# are clamped to the bag body (mdp.attach_strap for Isaac-HandleGrab, HandleGrabEnv._setup_scene for the direct
+# task). It spawns at the bag's pose, so its mesh is in the bag frame.
 #
 # Feel of the strap (all stiffnesses in Pa, "force per area"):
 #   HANDLE_STIFFNESS       one number that sets Young's modulus AND the stretch / shear / bend stiffness overrides
@@ -301,14 +306,16 @@ BAG_CFG = RigidObjectCfg(
 #                          set higher than stretch.
 #   HANDLE_THICKNESS       [m] shell thickness.
 #   HANDLE_DAMPING         damping of stretch / bending; higher = settles faster, less ringing.
-#   HANDLE_SOLVER_ITERS    position solver iterations. Stiff thin shells need many (cost grows with it).
+#   HANDLE_SOLVER_ITERS    position solver iterations. Stiff thin shells need many (cost grows with it). With the
+#                          6.5 mm ribbon, 32 keeps the arch within ~2.4 mm of its rest shape; 16 lets it sag ~10 mm,
+#                          64 holds it within ~1 mm for 1.7x the step time.
 # ===========================================================================
 HANDLE_STIFFNESS = 3.0e9  # [Pa]
 HANDLE_BEND_FACTOR = 10.0
 HANDLE_THICKNESS = 0.001  # [m]
 HANDLE_DENSITY = 1000.0  # [kg/m^3] -> the strap weighs ~1.5 g
 HANDLE_DAMPING = 0.2
-HANDLE_SOLVER_ITERS = 64
+HANDLE_SOLVER_ITERS = 32
 
 HANDLE_CFG = DeformableObjectCfg(
     prim_path="{ENV_REGEX_NS}/Handle",
@@ -398,7 +405,7 @@ D415_CFG = CameraCfg(
 
 @configclass
 class HandleGrabSceneCfg(InteractiveSceneCfg):
-    """Sandbox, SO-101, rigid bag, contact sensor, and lights.
+    """Sandbox, SO-101, bag, contact sensor, and lights, plus the soft strap when ``USE_DEFORMABLE_HANDLE`` is set.
 
     Same shape as the vial example's ``SO101SceneCfg``: the support surface, the robot (with its spawn
     pose on ``init_state``), the object, a contact sensor filtered to that object, and the lights. The
@@ -408,14 +415,7 @@ class HandleGrabSceneCfg(InteractiveSceneCfg):
     sandbox = SANDBOX_CFG
     robot = ARM_CFG
     bag = BAG_CFG
+    handle: DeformableObjectCfg | None = HANDLE_CFG if USE_DEFORMABLE_HANDLE else None
     contact: ContactSensorCfg = ARM_CONTACT_CFG
     ambient = AMBIENT_LIGHT_CFG
     overhead = OVERHEAD_LIGHT_CFG
-
-    def __post_init__(self):
-        super().__post_init__()
-        if USE_DEFORMABLE_HANDLE:
-            raise RuntimeError(
-                "The manager-based handle-grab task senses the strap through contact points, which PhysX cannot"
-                " report on deformables. Set USE_DEFORMABLE_HANDLE = False in handle_grab_scene.py."
-            )

@@ -15,11 +15,22 @@ import torch
 from isaaclab.utils.math import quat_apply
 
 from isaaclab_tasks.core.official_handle_grab import evaluation
-from isaaclab_tasks.core.official_handle_grab.mdp.curriculums import linear_weight_ramp
+from isaaclab_tasks.core.official_handle_grab.mdp.curriculums import (
+    fade_reset_phase,
+    linear_weight_ramp,
+    success_by_start,
+)
 from isaaclab_tasks.core.official_handle_grab.mdp.progress import GrabProgress
-from isaaclab_tasks.core.official_handle_grab.mdp.task import EE_TIP_OFFSET, JAW_INSERT_AXIS, load_grasp_goal
+from isaaclab_tasks.core.official_handle_grab.mdp.task import (
+    EE_TIP_OFFSET,
+    JAW_INSERT_AXIS,
+    JawGap,
+    load_grasp_goal,
+    strap_in_mouth,
+    strap_through_gap,
+)
 from isaaclab_tasks.core.official_handle_grab.reset import generator, viewer
-from isaaclab_tasks.core.official_handle_grab.reset.curriculum import ALL_PHASES, GRASP_CLOSED, HOME, PHASES
+from isaaclab_tasks.core.official_handle_grab.reset.curriculum import ALL_PHASES, GRASP, GRASP_CLOSING, HOME, PHASES
 from isaaclab_tasks.core.official_handle_grab.reset.dataset import ResetDataset, sample_rows, validate_phase_weights
 from isaaclab_tasks.core.official_handle_grab.scene import handle_grab_scene as scene
 from isaaclab_tasks.utils.hydra import resolve_task_config
@@ -32,55 +43,107 @@ rewards = importlib.import_module("isaaclab_tasks.core.official_handle_grab.mdp.
 ##
 
 
-def _run(progress: GrabProgress, holding: list[list[bool]], height: list[list[float]], start: int = 0) -> None:
-    """Feed per-step ``holding`` and bag ``height`` values (one inner list per step, one entry per environment)."""
-    for step, (hold, z) in enumerate(zip(holding, height), start=start):
-        progress.update(torch.tensor(hold), torch.tensor(z), torch.full((len(hold),), step))
+def _run(progress: GrabProgress, holding: list[list[bool]], start: int = 0) -> None:
+    """Feed per-step ``holding`` values (one inner list per step, one entry per environment)."""
+    for step, hold in enumerate(holding, start=start):
+        progress.update(torch.tensor(hold), torch.full((len(hold),), step))
 
 
-def test_lift_and_success_need_the_strap_in_the_jaws_not_just_a_rising_bag():
-    progress = GrabProgress(2, "cpu", lift_height=0.01, hold_steps=5, grasp_steps=2)
-    # Env 0 grasps at step 1 and lifts the bag; env 1 never holds the strap but the bag still rises 2 cm.
-    holding = [[True, False]] * 12
-    height = [[0.0, 0.0]] * 3 + [[0.02, 0.02]] * 9
-    _run(progress, holding, height)
+def test_success_needs_the_strap_held_for_the_whole_hold_time():
+    progress = GrabProgress(2, "cpu", hold_steps=5, grasp_steps=2)
+    # Env 0 holds the strap from step 0; env 1 never does.
+    _run(progress, [[True, False]] * 6)
     assert progress.grasped.tolist() == [True, False]
-    assert progress.lifted.tolist() == [True, False]
     assert progress.success.tolist() == [True, False]
-    assert progress.time_to_success[0] == 7  # lifted at step 3, five consecutive live steps: 3..7
-    assert progress.time_to_success[1] == -1
+    assert progress.time_to_success.tolist() == [4, -1]  # five consecutive held steps: 0..4
 
 
 def test_losing_the_strap_restarts_the_hold_and_only_a_sustained_loss_is_a_drop():
-    progress = GrabProgress(1, "cpu", lift_height=0.01, hold_steps=4, grasp_steps=1, drop_steps=3)
-    up = [[0.02]]
-    _run(progress, [[True], [True], [True], [False]], [[0.0]] + up * 3)
+    progress = GrabProgress(1, "cpu", hold_steps=4, grasp_steps=1, drop_steps=3)
+    _run(progress, [[True], [True], [True], [False]])
     assert progress.grasped[0] and not progress.dropped[0]  # one lost step is a flicker, not a drop
-    _run(progress, [[True]] * 3, up * 3, start=4)
+    _run(progress, [[True]] * 3, start=4)
     # The hold restarted at the flicker: 3 live steps since it, one short of the 4 needed.
     assert not progress.success[0] and not progress.dropped[0]
-    _run(progress, [[False]] * 3, up * 3, start=7)
+    _run(progress, [[False]] * 3, start=7)
     assert progress.dropped[0] and not progress.success[0]
 
 
-def test_pinch_only_succeeds_on_a_held_strap_without_lifting():
-    progress = GrabProgress(1, "cpu", hold_steps=4, grasp_steps=1, require_lift=False)
-    _run(progress, [[True]] * 6, [[0.0]] * 6)
-    assert progress.success[0] and not progress.lifted[0]
-
-
 def test_reset_clears_only_the_requested_environments():
-    progress = GrabProgress(2, "cpu", hold_steps=1, grasp_steps=1, require_lift=False)
-    _run(progress, [[True, True]] * 2, [[0.0, 0.0]] * 2)
+    progress = GrabProgress(2, "cpu", hold_steps=1, grasp_steps=1)
+    _run(progress, [[True, True]] * 2)
     progress.reset([1])
     assert progress.success.tolist() == [True, False]
     assert progress.time_to_success.tolist() == [0, -1]
-    assert progress.rest_height[1] == float("inf") and progress.rest_height[0] == 0.0
 
 
 ##
 # Rewards and curriculum.
 ##
+
+
+def test_strap_counts_in_the_mouth_when_a_segment_crosses_any_box_not_the_space_between():
+    # Two boxes along y in the link frame, a 10 mm empty band between them, like the slices of the closed mouth.
+    mouth = JawGap.from_json(
+        {
+            "origin": [0.0, 0.0, 0.0],
+            "axes": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            "boxes": [
+                {"min": [-0.01, -0.03, -0.01], "max": [0.01, -0.02, 0.01]},
+                {"min": [-0.01, 0.02, -0.01], "max": [0.01, 0.03, 0.01]},
+            ],
+        },
+        "cpu",
+    )
+    # One-column straps crossing the jaws along x: through the second box, and through the empty band.
+    line = torch.tensor([[-0.02, 0.0, 0.0], [0.02, 0.0, 0.0]])
+    nodes = torch.stack((line + torch.tensor([0.0, 0.025, 0.0]), line))
+    identity = torch.tensor([[0.0, 0.0, 0.0, 1.0]] * 2)
+    assert strap_through_gap(nodes, torch.zeros(2, 3), identity, mouth, columns=1).tolist() == [True, False]
+    # The single closed_gap box (the direct task's entry) loads as a one-box stack.
+    box = {"origin": [0.0] * 3, "axes": mouth.axes.tolist(), "min": [-0.01] * 3, "max": [0.01] * 3}
+    single = JawGap.from_json(box, "cpu")
+    assert single.bounds.shape == (1, 2, 3)
+    assert strap_through_gap(nodes, torch.zeros(2, 3), identity, single, columns=1).tolist() == [False, True]
+
+
+def test_grasp_needs_the_strap_to_cross_the_mouth_side_to_side_not_through_the_front_or_along_the_jaws():
+    # One box in the link frame: axis 0 is the hinge (the gripper's sides), axis 1 along the jaws, axis 2 across them.
+    mouth = JawGap.from_json(
+        {
+            "origin": [0.0, 0.0, 0.0],
+            "axes": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            "boxes": [{"min": [-0.01, -0.03, -0.005], "max": [0.01, -0.02, 0.005]}],
+        },
+        "cpu",
+    )
+    x = torch.linspace(-0.035, 0.035, 8)
+    side_to_side = torch.stack((x, torch.full_like(x, -0.025), torch.zeros_like(x)), dim=-1)
+    # Enters through a side face, then leaves through the front face (axis 1 below -0.03) before the other side.
+    out_the_front = torch.tensor(
+        [
+            [-0.035, -0.025, 0],
+            [-0.025, -0.025, 0],
+            [-0.015, -0.025, 0],
+            [-0.005, -0.025, 0],
+            [0, -0.035, 0],
+            [0, -0.045, 0],
+            [0.015, -0.045, 0],
+            [0.025, -0.045, 0],
+        ]
+    )
+    y = torch.linspace(-0.045, -0.005, 8)
+    along_the_jaws = torch.stack((torch.zeros_like(y), y, torch.zeros_like(y)), dim=-1)
+    nodes = torch.stack((side_to_side, out_the_front, along_the_jaws))
+    identity = torch.tensor([[0.0, 0.0, 0.0, 1.0]] * 3)
+    grasp = strap_in_mouth(nodes, torch.zeros(3, 3), identity, mouth, columns=1)
+    assert grasp.through.tolist() == [True, False, False]
+    assert float(grasp.along[0]) == pytest.approx(0.5)  # nodes 2 and 5 bracket the crossing, the middle of 8
+    assert torch.isnan(grasp.along[1:]).all()
+    # The back point is the centre of the box's back face, (0, -0.02, 0); the first strap passes 5 mm in front of it.
+    assert float(grasp.back_dist[0]) == pytest.approx(0.005, abs=1e-6)
+    # The direct task's looser test counts any strap touching the box, including the two rejected here.
+    assert strap_through_gap(nodes, torch.zeros(3, 3), identity, mouth, columns=1).tolist() == [True, True, True]
 
 
 def _reward_env(progress: GrabProgress) -> SimpleNamespace:
@@ -102,21 +165,39 @@ def test_approach_reward_pays_progress_only_before_the_grasp_and_not_on_the_firs
     assert float(term(env, scale=0.01)) == 0.0  # a closing hand is no longer approaching
 
 
-def test_milestones_pay_once_and_never_pay_what_the_reset_restored():
+def test_jaw_closing_pays_closing_at_the_strap_once_and_not_reopening_and_closing_again(monkeypatch):
+    env = _reward_env(GrabProgress(1, "cpu"))
+    term = rewards.jaw_closing(SimpleNamespace(params={}), env)
+    # (tip distance to the strap [m], closed fraction) per step.
+    states = iter([(0.0, 0.0), (0.0, 0.5), (0.0, 0.0), (0.0, 0.5), (0.3, 1.0), (0.0, 1.0)])
+    state = {}
+
+    def tip(_):
+        state["d"], state["f"] = next(states)
+        return torch.tensor([[state["d"], 0.0, 0.0]])
+
+    monkeypatch.setattr(rewards, "tip_pos_w", tip)
+    monkeypatch.setattr(rewards, "strap_target_w", lambda _: torch.zeros(1, 3))
+    monkeypatch.setattr(rewards, "gripper_closed_fraction", lambda _: torch.tensor([state["f"]]))
+
+    paid = [float(term(env, std=0.02)) for _ in range(6)]
+    # Baseline, half closed at the strap, reopened, half closed again, fully closed far away, fully closed at the strap.
+    assert paid == pytest.approx([0.0, 0.5, 0.0, 0.0, 0.0, 0.5], abs=1e-4)
+
+
+def test_grasp_milestone_pays_once_per_episode_and_not_on_the_first_step():
     progress = GrabProgress(1, "cpu")
-    progress.grasped[:] = True  # a grasp_closed reset restores the grasp milestone
     env = _reward_env(progress)
     term = rewards.milestones(SimpleNamespace(params={}), env)
-    assert float(term(env)[0]) == 0.0  # the first step after the reset pays nothing
-    progress.lifted[:] = True
-    assert float(term(env)[0]) == 2.0  # the lift is earned, the restored grasp still is not
+    progress.grasped[:] = True
+    assert float(term(env)[0]) == 0.0  # already latched on the first step after the reset
     assert float(term(env)[0]) == 0.0
     term.reset(None)
     progress.grasped[:] = False
-    progress.lifted[:] = False
     term(env)
     progress.grasped[:] = True
     assert float(term(env)[0]) == 1.0
+    assert float(term(env)[0]) == 0.0
 
 
 def test_lower_body_penalty_ramp_grows_linearly_and_saturates():
@@ -128,6 +209,44 @@ def test_lower_body_penalty_ramp_grows_linearly_and_saturates():
     assert ramp(env, None, **kwargs) == pytest.approx(-2.0)
     env.common_step_counter = 10**6
     assert ramp(env, None, **kwargs) == -4.0
+
+
+def test_reset_fade_moves_one_phase_weight_and_leaves_a_mix_without_it_alone():
+    term = SimpleNamespace(params={"phase_weights": dict(ALL_PHASES)})
+    env = SimpleNamespace(common_step_counter=0, event_manager=SimpleNamespace(get_term_cfg=lambda _: term))
+    kwargs = dict(phase=GRASP_CLOSING, start_weight=1.0, final_weight=0.0, fade_steps=1000)
+    assert fade_reset_phase(env, None, **kwargs) == 1.0
+    env.common_step_counter = 500
+    assert fade_reset_phase(env, None, **kwargs) == pytest.approx(0.5)
+    env.common_step_counter = 10**6
+    assert fade_reset_phase(env, None, **kwargs) == 0.0
+    assert term.params["phase_weights"] == {**ALL_PHASES, GRASP_CLOSING: 0.0}
+    assert ALL_PHASES[GRASP_CLOSING] == 1.0  # the shared default mix is not modified
+    term.params["phase_weights"] = {HOME: 1.0}
+    assert fade_reset_phase(env, None, **kwargs) is None
+    assert term.params["phase_weights"] == {HOME: 1.0}
+
+
+def test_success_by_start_splits_finished_episodes_by_their_reset_phase():
+    progress = GrabProgress(4, "cpu")
+    env = SimpleNamespace(
+        num_envs=4,
+        device="cpu",
+        _hg_progress=progress,
+        _hg_reset_phase=torch.tensor([PHASES.index(HOME), PHASES.index(HOME), PHASES.index(GRASP_CLOSING), 0]),
+        episode_length_buf=torch.tensor([10, 10, 10, 0]),
+    )
+    term = success_by_start(SimpleNamespace(params={}), env)
+    progress.success[:] = torch.tensor([True, False, True, True])
+    rates = term(env, slice(None), window=200)
+    # Env 3 never stepped (the reset before the first step), so it is not an episode.
+    assert rates[HOME] == pytest.approx(0.5)
+    assert rates[GRASP_CLOSING] == pytest.approx(1.0)
+    assert rates[GRASP] == 0.0
+    progress.success[:] = False
+    rates = term(env, torch.tensor([0, 1]), window=200)
+    assert rates[HOME] == pytest.approx(0.25)  # four home episodes, one success
+    assert rates[GRASP_CLOSING] == pytest.approx(1.0)  # not among the envs reset this time
 
 
 ##
@@ -166,15 +285,15 @@ def test_viewer_plays_one_attempt_through_its_phases_before_the_next_attempt():
 def test_phase_sampling_draws_only_weighted_phases_in_proportion():
     dataset = _dataset()
     torch.manual_seed(0)
-    rows = sample_rows(dataset, {HOME: 1.0, GRASP_CLOSED: 3.0}, 4000)
+    rows = sample_rows(dataset, {HOME: 1.0, GRASP: 3.0}, 4000)
     phases = dataset.phase[rows]
-    assert set(phases.tolist()) == {PHASES.index(HOME), PHASES.index(GRASP_CLOSED)}
-    assert (phases == PHASES.index(GRASP_CLOSED)).float().mean() == pytest.approx(0.75, abs=0.05)
+    assert set(phases.tolist()) == {PHASES.index(HOME), PHASES.index(GRASP)}
+    assert (phases == PHASES.index(GRASP)).float().mean() == pytest.approx(0.75, abs=0.05)
 
 
 @pytest.mark.parametrize(
     "weights",
-    [{"lift": 1.0}, {HOME: -1.0}, {HOME: 0.0}],
+    [{"reorient": 1.0}, {HOME: -1.0}, {HOME: 0.0}],
     ids=["unknown_phase", "negative_weight", "no_positive_weight"],
 )
 def test_phase_weights_are_validated_against_the_dataset(weights):
@@ -184,9 +303,9 @@ def test_phase_weights_are_validated_against_the_dataset(weights):
 
 def test_missing_phase_rows_are_reported():
     dataset = _dataset()
-    keep = dataset.phase != PHASES.index(GRASP_CLOSED)
+    keep = dataset.phase != PHASES.index(GRASP)
     partial = ResetDataset(dataset.phase[keep], dataset.attempt[keep], dataset.joint_pos[keep], dataset.bag_pose[keep])
-    with pytest.raises(ValueError, match=GRASP_CLOSED):
+    with pytest.raises(ValueError, match=GRASP):
         validate_phase_weights(partial, ALL_PHASES)
 
 
@@ -311,6 +430,16 @@ def test_ik_selection_keeps_the_valid_start_nearest_the_seed_and_rejects_limit_p
     assert pick.delta[0] == pytest.approx(math.hypot(0.3, 0.1))
 
 
+def test_ik_selection_accepts_a_start_clamped_onto_the_inset_search_limit():
+    seed = torch.zeros(1, 1)
+    low, high = torch.tensor([-2.2275]), torch.tensor([0.9141])  # revolute_4 limits [rad], float32
+    q = (high - 0.03).reshape(1, 1, 1)  # where WristIK.solve clamps a start pushed against the stop
+    pick = generator.select_ik_solution(
+        q, torch.tensor([[0.001]]), torch.tensor([[0.1]]), seed, low, high, pos_tol=0.005, rot_tol=0.31, margin=0.03
+    )
+    assert pick.valid.tolist() == [True]
+
+
 def test_ik_selection_reports_the_best_position_error_when_no_start_is_valid_and_ignores_nan():
     seed = torch.zeros(2, 2)
     low, high = torch.full((2,), -1.0), torch.full((2,), 1.0)
@@ -324,6 +453,20 @@ def test_ik_selection_reports_the_best_position_error_when_no_start_is_valid_and
     assert pick.valid.tolist() == [False, False]
     assert pick.index.tolist() == [1, 0]  # smallest position error, even though row 1's NaN start reads 0.0 m
     assert pick.valid_count.tolist() == [0, 0]
+
+
+def test_seed_bank_keeps_one_child_per_parent_and_retries_the_ones_without_one():
+    bank = generator._Bank()
+    joints = torch.zeros(3, 7)
+    pose = torch.zeros(3, 7)
+    assert bank.add(joints, pose, torch.tensor([4, 4, 9])) == 2
+    child = generator._Bank()
+    assert child.add(joints[:1], pose[:1], torch.tensor([4])) == 1
+    drawn = set()
+    for _ in range(30):
+        _joints, _pose, attempt = bank.sample(4, "cpu", child)
+        drawn.update(int(v) for v in attempt.tolist())
+    assert drawn == {9}
 
 
 def test_randomized_ik_selection_draws_only_valid_starts_and_covers_all_of_them():
@@ -373,32 +516,17 @@ def _resolve(task: str, *presets: str):
 
 
 def test_the_arm_stands_upright_on_the_tray_wall():
-    from isaaclab.utils.math import quat_mul
-
     cfg, _ = _resolve("Isaac-HandleGrab")
-    # The wrapper keeps a 90 deg roll about X on /Arm/Mount. The spawn rotation is the 180 deg yaw.
-    mount_roll = torch.tensor((0.70710678, 0.0, 0.0, 0.70710678))
+    # init_state.rot is written onto the articulation root, so it carries the 90 deg roll and the 180 deg yaw.
     spawned = torch.tensor(cfg.scene.robot.init_state.rot)
-    upright = quat_mul(spawned, mount_roll)
-    cad_up = quat_apply(upright, torch.tensor((0.0, 1.0, 0.0)))
+    cad_up = quat_apply(spawned, torch.tensor((0.0, 1.0, 0.0)))
     assert torch.allclose(cad_up, torch.tensor((0.0, 0.0, 1.0)), atol=1e-5)
-    assert cfg.scene.robot.init_state.rot == (0.0, 0.0, 1.0, 0.0)
+    assert cfg.scene.robot.init_state.rot == (0.0, 0.70710678, 0.70710678, 0.0)
     assert cfg.scene.robot.init_state.rot == scene.ARM_BASE_ROT
     assert cfg.scene.robot.init_state.pos == scene.ARM_BASE_POS
     assert scene.ARM_CFG.init_state.rot == scene.ARM_BASE_ROT
     assert cfg.scene.sandbox.spawn.usd_path == scene.SANDBOX_SPAWN_USD
     assert cfg.scene.bag.spawn.usd_path == scene.BAG_SPAWN_USD
-
-
-def test_pinch_only_preset_drops_the_lift_requirement_from_every_term_that_reads_it():
-    default, _ = _resolve("Isaac-HandleGrab")
-    pinch, _ = _resolve("Isaac-HandleGrab", "pinch_only")
-    for cfg, require_lift, lift_weight in ((default, True, 2.0), (pinch, False, 0.0)):
-        assert cfg.terminations.success.params["require_lift"] == require_lift
-        assert cfg.rewards.held_goal.params["require_lift"] == require_lift
-        assert cfg.rewards.milestones.params["weights"][1] == lift_weight
-    assert GRASP_CLOSED not in pinch.events.reset_from_dataset.params["phase_weights"]
-    assert set(default.events.reset_from_dataset.params["phase_weights"]) == set(PHASES)
 
 
 def test_sim2real_preset_starts_every_episode_at_home_and_randomizes_the_physics():
@@ -413,8 +541,8 @@ def test_sim2real_preset_starts_every_episode_at_home_and_randomizes_the_physics
     ("task", "entry_point", "groups"),
     [
         ("Isaac-HandleGrab", "rsl_rl_cfg_entry_point", {"actor": "policy", "critic": "critic"}),
-        ("Isaac-HandleGrab-Camera", "rsl_rl_cfg_entry_point", {"actor": "overhead_rgb", "critic": "critic"}),
-        ("Isaac-HandleGrab-Camera", "rsl_rl_distillation_cfg_entry_point", {"student": "overhead_rgb"}),
+        ("Isaac-HandleGrab-Camera", "rsl_rl_cfg_entry_point", {"actor": "overhead_depth", "critic": "critic"}),
+        ("Isaac-HandleGrab-Camera", "rsl_rl_distillation_cfg_entry_point", {"student": "overhead_depth"}),
     ],
 )
 def test_agent_observation_groups_exist_in_the_environment(task, entry_point, groups):
@@ -456,7 +584,7 @@ class _ScriptedEnv:
         self.step_count += 1
         succeeded = self.step_count == 2
         done = torch.tensor([self.step_count in (2, 4), self.step_count == 5])
-        self._hg_terminal_progress = torch.tensor([[True, True, succeeded], [True, False, False]])
+        self._hg_terminal_progress = torch.tensor([[True, succeeded], [True, False]])
         self._hg_terminal_max_lower_force = torch.tensor([0.5, 2.0])
         self._hg_terminal_time_to_success_s = torch.tensor([1.5 if succeeded else -0.03, -0.03])
         return {}, torch.zeros(2), done, torch.zeros(2, dtype=torch.bool), {}
@@ -466,6 +594,6 @@ def test_evaluation_counts_each_environments_first_episodes_only():
     summary = evaluation.evaluate(_ScriptedEnv(), lambda obs: torch.zeros(2, 1), episodes_per_env=1)
     # Env 0's failed second episode (step 4) finishes before env 1's first, and must not be counted.
     assert summary.episodes == 2
-    assert summary.success_rate == 0.5 and summary.drop_rate == 0.5 and summary.lift_rate == 0.5
+    assert summary.success_rate == 0.5 and summary.drop_rate == 0.5 and summary.grasp_rate == 1.0
     assert summary.mean_time_to_success_s == pytest.approx(1.5)
     assert summary.max_peak_lower_body_force_n == 2.0

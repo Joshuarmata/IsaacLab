@@ -15,7 +15,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply_inverse
 
 from .progress import grab_progress
-from .task import BAG, ROBOT, gripper_closed_fraction, lower_body_force, strap_contacts, strap_target_w, tip_pos_w
+from .task import BAG, ROBOT, gripper_closed_fraction, lower_body_force, strap_target_w, tip_pos_w
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -48,21 +48,17 @@ def strap_in_base_frame(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 
 def grab_features(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Distance from the jaw tip to the strap, the bag's rise, the bag's speed, and how far the jaw has closed."""
-    progress = grab_progress(env)
+    """Distance from the jaw tip to the strap, the bag's speed, and how far the jaw has closed."""
     distance = torch.linalg.vector_norm(tip_pos_w(env) - strap_target_w(env), dim=-1)
     speed = torch.linalg.vector_norm(env.scene[BAG].data.root_lin_vel_w.torch, dim=-1)
-    return torch.stack((distance, progress.lift, speed, gripper_closed_fraction(env)), dim=-1)
+    return torch.stack((distance, speed, gripper_closed_fraction(env)), dim=-1)
 
 
 def progress_flags(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Latched grasp and lift milestones, which make the once-per-episode rewards Markov."""
-    progress = grab_progress(env)
-    return torch.stack((progress.grasped, progress.lifted), dim=-1).float()
+    """The latched grasp milestone, which makes the once-per-episode grasp reward Markov."""
+    return grab_progress(env).grasped.float().unsqueeze(-1)
 
 
-def jaw_contact_flags(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Privileged rigid-jaw, moving-jaw and bilateral strap contact, plus the force on the lower body [N]."""
-    rigid_on, moving_on = strap_contacts(env)
-    force = lower_body_force(env)
-    return torch.stack((rigid_on.float(), moving_on.float(), (rigid_on & moving_on).float(), force), dim=-1)
+def lower_body_force_feature(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Privileged force [N] the arm puts on the lower part of the bag body, shape ``(num_envs, 1)``."""
+    return lower_body_force(env).unsqueeze(-1)

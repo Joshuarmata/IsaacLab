@@ -2,34 +2,34 @@
   "_comment": "Written by grasp_pose_tool.py --record. Everything is in the BAG frame (x, y, z) / (x, y, z, w).",
   "waypoint": "grasp",
   "tip_pos_bag": [
-    -0.00223,
-    -0.01259,
-    0.08369
+    -0.02269,
+    -0.01279,
+    0.08967
   ],
   "jaw_quat_bag": [
-    0.07243,
-    -0.88929,
-    0.08498,
-    0.44351
+    0.07562,
+    -0.85582,
+    0.14132,
+    0.49182
   ],
   "moving_jaw_pos_bag": [
-    0.14458,
-    0.02866,
-    0.07043
+    0.1167,
+    0.03986,
+    0.04833
   ],
-  "gripper_deg": -0.4,
+  "gripper_deg": -20.4,
   "joints_deg": {
-    "revolute_1": -10.2,
-    "revolute_2": 145.5,
-    "revolute_3": -111.4,
-    "revolute_4": 39.4,
-    "revolute_5": -0.0,
-    "revolute_6": -128.2,
-    "revolute_7": -0.4
+    "revolute_1": -1.5,
+    "revolute_2": 133.3,
+    "revolute_3": -92.7,
+    "revolute_4": 25.9,
+    "revolute_5": -2.0,
+    "revolute_6": -118.4,
+    "revolute_7": -20.4
   },
   "contact_at_record": {
-    "grasped": false,
-    "rest_count": 0,
+    "grasped": true,
+    "rest_count": 9,
     "strap_count": 0
   }
 }

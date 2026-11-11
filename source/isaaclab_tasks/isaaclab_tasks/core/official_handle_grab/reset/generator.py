@@ -5,16 +5,18 @@
 
 """Generate the physics-validated reset dataset of the handle-grab task.
 
-For every attempt the generator places the bag somewhere in the spawn box, solves inverse kinematics for the recorded
-pinch (and for a pregrasp a few centimetres back along the approach axis), then drives the arm there in PhysX through
-the task's own relative-joint action interface: home, pregrasp, grasp with the jaw open, and the jaw closed on the
-strap. An attempt is kept only if the physics ends in a true zone grasp (the same ``holding`` test the task rewards)
-without the arm leaning on the bag body or knocking the bag. Every accepted attempt contributes one row per phase::
+The attempt follows the vial generator. The arm settles at home, then the bag is placed in the spawn box and settled:
+that is the home row. Each later phase is continued from rows of the phase before it that physics already accepted
+(a seed bank), and each phase is filled to its own quota. The long approach runs with the bag pinned out of the
+workspace; the bag is put back before the jaw moves onto the strap, and the closing grasp shuts the jaw most of the
+way. The task is grasp-only for now, so the vial's lift phases are not generated (``LIFT_GRAVEYARD.md``), and there is
+no rack, so neither are its reorient, transport, insert, and release phases::
 
     uv run python -m isaaclab_tasks.core.official_handle_grab.reset.generator
 
 Writes ``handle_grab_reset_dataset.pt`` next to this file. Rows hold measured joint positions and the bag's pose in the
-environment frame, so no row starts interpenetrating or off the strap.
+environment frame, plus the deformable strap's shape in the bag frame, so no row starts interpenetrating or off the
+strap.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ from ..mdp.task import (
     EE_BODY_NAME,
     EE_TIP_OFFSET,
     GRIPPER_CLOSED_POS,
+    GRIPPER_HOLD_POS,
     GRIPPER_OPEN_POS,
     JAW_INSERT_AXIS,
     ROBOT,
@@ -57,29 +60,34 @@ from ..mdp.task import (
     holding,
     load_grasp_goal,
     lower_body_force,
-    strap_contacts,
+    strap_grasp,
+    strap_nodes_bag,
     strap_target_w,
     tip_pos_w,
+    write_strap,
 )
-from .curriculum import GRASP, GRASP_CLOSED, HOME, PHASES, PREGRASP
+from .curriculum import GRASP, GRASP_CLOSING, HOME, PHASES, PREGRASP
 from .dataset import DEFAULT_DATASET_PATH, ResetDataset
 
 TASK = "Isaac-HandleGrab"
 
 JOINT_SPEED = 0.4
-"""Scripted joint speed [rad/s]; below the arm's 0.5 rad/s drive cap, so the arm keeps up with the command."""
+"""Scripted joint speed [rad/s]; slow enough that the 3 N*m drives keep up with the command."""
 SETTLE_STEPS = 30
 """Policy steps the bag and arm rest before home is recorded."""
 HOLD_STEPS = 15
 """Policy steps the arm rests at each open-jaw waypoint before it is recorded."""
-CLOSE_HOLD_STEPS = 20
-"""Policy steps the closed jaw is held before the grasp is judged."""
-HOLDING_STREAK = 10
-"""The strap must be in the jaws for this many consecutive final steps."""
-MAX_BAG_LIFT = 0.005
-"""A closed grasp that raised the bag more than this [m] is not a resting grasp."""
+CLOSING_JAW_POS = GRIPPER_HOLD_POS + 0.2
+"""Jaw angle [rad] of a ``grasp_closing`` row: 0.2 rad short of the hold angle, so the row is not yet a grasp."""
+CLOSING_SETTLE_STEPS = 30
+"""Policy steps the partly closed jaw rests before the row is recorded; the drive lags the command."""
+CLOSE_STEPS = 150
+"""Policy steps the jaw is then commanded shut to check that the row can be grasped. The drive lags the command
+(0.75 rad in 45 steps), and the closing jaw sweeps the strap into the mouth over the last part of the travel."""
+PARK_HEIGHT = 1.0
+"""Height [m] the bag is pinned to during the home-to-pregrasp sweep, above the arm's reach."""
 MAX_BAG_SPEED = 0.02
-"""A closed grasp whose bag still moves faster than this [m/s] is not settled."""
+"""A row whose bag still moves faster than this [m/s] is not settled."""
 PREGRASP_POSITION_TOLERANCE = 0.015
 """Position tolerance [m] of the pregrasp IK, the vial generator's tolerance for intermediate waypoints."""
 MAX_SEED_TIP_ERROR = 0.05
@@ -189,6 +197,8 @@ IK_POSITION_WEIGHT = 100.0
 """Weight of the position rows in the IK cost; the vial generator's ``position_weight``."""
 IK_ROTATION_WEIGHT = 1.0
 """Weight of the rotation rows; the vial generator's ``rotation_weight`` ("position dominates")."""
+IK_MARGIN_SLACK = 1e-5
+"""Slack [rad] on the joint-margin check, so a start clamped onto the inset search limit still counts as valid."""
 
 
 class IKSolution(NamedTuple):
@@ -242,7 +252,8 @@ def select_ik_solution(
     low, high = low.unsqueeze(-2), high.unsqueeze(-2)
     clearance = torch.minimum(q - low, high - q).amin(dim=-1)
     delta = torch.linalg.vector_norm(q - seed.unsqueeze(1), dim=-1)
-    ok = torch.isfinite(q).all(dim=-1) & (pos_err <= pos_tol) & (rot_err <= rot_tol) & (clearance >= margin)
+    clear = clearance >= margin - IK_MARGIN_SLACK
+    ok = torch.isfinite(q).all(dim=-1) & (pos_err <= pos_tol) & (rot_err <= rot_tol) & clear
     valid = ok.any(dim=-1)
     nearest = delta.masked_fill(~ok, torch.inf).argmin(dim=-1)
     best_position = torch.nan_to_num(pos_err, nan=torch.inf, posinf=torch.inf).argmin(dim=-1)
@@ -423,7 +434,7 @@ class Driver:
     """Moves the arm through the task's action interface, so the dataset is reachable by policy actions.
 
     The task applies ``target = measured joint position + action * scale``. The driver turns a desired joint position
-    into the action that makes that target, with a slowly integrated trim on the arm joints that cancels gravity sag.
+    into the action that makes that target, with a slowly integrated trim on the arm joints that cancels sag under load.
     The jaw gets no trim: a stalled jaw is commanded at most one action step past itself, the policy's own squeeze.
     """
 
@@ -439,6 +450,7 @@ class Driver:
         self.trim = torch.zeros(env.num_envs, 7, device=env.device)  # the jaw's entry stays zero
         self.peak_lower_force = torch.zeros(env.num_envs, device=env.device)
         self.streak = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        self._park: torch.Tensor | None = None
 
     def joints(self) -> torch.Tensor:
         return self.robot.data.joint_pos.torch.clone()
@@ -448,10 +460,14 @@ class Driver:
         self.streak.zero_()
 
     def step(self, q_cmd: torch.Tensor) -> None:
+        if self._park is not None:
+            self.write_bag(self._park)
         err = q_cmd - self.robot.data.joint_pos.torch
         self.trim[:, :6] = (self.trim[:, :6] + self.TRIM_GAIN * err[:, :6]).clamp(-self.TRIM_LIMIT, self.TRIM_LIMIT)
         action = ((err + self.trim) / self.scale).clamp(-1.0, 1.0)
         self.env.step(action)
+        if self._park is not None:
+            self.write_bag(self._park)
         self.peak_lower_force = torch.maximum(self.peak_lower_force, lower_body_force(self.env))
         self.streak = torch.where(holding(self.env), self.streak + 1, torch.zeros_like(self.streak))
 
@@ -468,25 +484,54 @@ class Driver:
             self.step(q0 + (q_target - q0) * (k / steps))
         self.hold(q_target, settle_steps)
 
-    def close_jaw(self, q_arm: torch.Tensor) -> None:
-        """Ramp the jaw shut at :data:`JOINT_SPEED` with the arm held at ``q_arm``, then keep squeezing."""
-        q_cmd = q_arm.clone()
-        start = float(q_cmd[:, 6].max())
-        steps = math.ceil((start - GRIPPER_CLOSED_POS) / JOINT_SPEED / self.env.step_dt)
-        for k in range(1, steps + 1):
-            q_cmd[:, 6] = start + (GRIPPER_CLOSED_POS - start) * (k / steps)
-            self.step(q_cmd)
-        q_cmd[:, 6] = GRIPPER_CLOSED_POS
-        self.hold(q_cmd, CLOSE_HOLD_STEPS)
-
     def snapshot(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Measured joints and the bag's pose in the environment frame."""
+        """Measured joints and the bag's state.
+
+        The bag state is its pose in the environment frame (7 columns), followed by the deformable strap's nodes in
+        the bag frame, flattened (none with the rigid strap). :meth:`write_bag` takes the same layout, so a parked
+        or restored bag keeps the shape the jaws gave its strap.
+        """
         origins = self.env.scene.env_origins
-        pose = torch.cat(
-            (self.bag.data.root_pos_w.torch - origins, self.bag.data.root_quat_w.torch),
+        state = torch.cat(
+            (
+                self.bag.data.root_pos_w.torch - origins,
+                self.bag.data.root_quat_w.torch,
+                strap_nodes_bag(self.env).flatten(1),
+            ),
             dim=-1,
         )
-        return self.joints(), pose
+        return self.joints(), state
+
+    def write_bag(self, state_env: torch.Tensor) -> None:
+        """Write a bag state (see :meth:`snapshot`) and zero its velocity. A bare pose lays the strap at rest."""
+        n = state_env.shape[0]
+        pose_w = state_env[:, :7].clone()
+        pose_w[:, :3] += self.env.scene.env_origins
+        self.bag.write_root_pose_to_sim_index(root_pose=pose_w, env_ids=self.ids)
+        self.bag.write_root_velocity_to_sim_index(
+            root_velocity=torch.zeros(n, 6, device=self.env.device), env_ids=self.ids
+        )
+        write_strap(self.env, self.ids, pose_w, state_env[:, 7:].reshape(n, -1, 3))
+
+    def pin_bag(self, pose_env: torch.Tensor | None) -> None:
+        """Hold the bag at ``pose_env`` on every step, or release it when ``pose_env`` is ``None``.
+
+        The approach sweep pins the bag above the arm, the way the vial generator parks the vial. A dynamic bag
+        placed there once would fall through the sweep, so the pose is rewritten before and after each step.
+        """
+        self._park = None if pose_env is None else pose_env.clone()
+
+    def restore(self, q: torch.Tensor, bag_pose: torch.Tensor, settle: int) -> None:
+        """Put the arm and the bag back at a seed-bank row and hold that command."""
+        self.pin_bag(None)
+        self.trim.zero_()
+        self.robot.write_joint_position_to_sim_index(position=q, env_ids=self.ids)
+        self.robot.write_joint_velocity_to_sim_index(velocity=torch.zeros_like(q), env_ids=self.ids)
+        self.robot.actuators.target_command.set_position_index(value=q, joint_ids=None, env_ids=self.ids)
+        self.write_bag(bag_pose)
+        self.env.sim.forward()
+        self.begin_monitoring()
+        self.hold(q, settle)
 
 
 ##
@@ -520,230 +565,417 @@ def configure_env_cfg(env_cfg, args: argparse.Namespace) -> None:
     env_cfg.scene.num_envs = args.num_envs
 
 
-def run_batch(
-    env, driver: Driver, ik: WristIK, args: argparse.Namespace
-) -> tuple[dict[str, tuple[torch.Tensor, torch.Tensor]], Counter, dict[str, torch.Tensor]]:
-    """Script one attempt in every environment.
+class _Bank:
+    """Rows of one phase that physics accepted, the vial generator's seed bank."""
 
-    Returns:
-        The accepted ``(joints, bag pose)`` rows per phase, why the rest were rejected, and per-environment
-        measurements (tracking errors, contacts, forces) for diagnosing rejections.
-    """
-    robot, bag, device = driver.robot, driver.bag, env.device
-    n = env.num_envs
-    goal = load_grasp_goal()
+    def __init__(self) -> None:
+        self.q: list[torch.Tensor] = []
+        self.pose: list[torch.Tensor] = []
+        self.attempt: list[torch.Tensor] = []
+
+    def __len__(self) -> int:
+        return sum(t.shape[0] for t in self.q)
+
+    def stacked(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return torch.cat(self.q), torch.cat(self.pose), torch.cat(self.attempt)
+
+    def add(self, q: torch.Tensor, pose: torch.Tensor, attempt: torch.Tensor) -> int:
+        """Append rows whose attempt id is not already in the bank. One parent yields one child."""
+        if q.shape[0] == 0:
+            return 0
+        seen = set(self.stacked()[2].tolist()) if len(self) else set()
+        keep: list[int] = []
+        for i, raw in enumerate(attempt.tolist()):
+            ident = int(raw)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            keep.append(i)
+        if not keep:
+            return 0
+        index = torch.tensor(keep, dtype=torch.long, device=q.device)
+        attempt = attempt.to(q.device)
+        self.q.append(q[index].detach().cpu())
+        self.pose.append(pose[index].detach().cpu())
+        self.attempt.append(attempt[index].detach().cpu())
+        return len(keep)
+
+    def sample(
+        self, n: int, device: torch.device | str, child: _Bank | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Draw ``n`` parent rows, preferring ones that do not already have a child."""
+        q, pose, attempt = self.stacked()
+        if child is not None and len(child):
+            taken = {int(v) for v in child.stacked()[2].tolist()}
+            keep = [i for i, raw in enumerate(attempt.tolist()) if int(raw) not in taken]
+            if keep:
+                index = torch.tensor(keep, dtype=torch.long)
+                q, pose, attempt = q[index], pose[index], attempt[index]
+        pick = torch.randint(q.shape[0], (n,))
+        return q[pick].to(device), pose[pick].to(device), attempt[pick].to(device)
+
+
+def _gate(checks: tuple[tuple[str, torch.Tensor], ...]) -> tuple[torch.Tensor, Counter]:
+    accepted = torch.ones(checks[0][1].shape[0], dtype=torch.bool, device=checks[0][1].device)
+    rejected: Counter = Counter()
+    for name, bad in checks:
+        newly = accepted & bad
+        rejected[name] += int(newly.sum())
+        accepted &= ~bad
+    return accepted, rejected
+
+
+def _jaw_quat(goal, args: argparse.Namespace) -> tuple[float, float, float, float]:
     if goal.jaw_quat_bag is None:
         raise RuntimeError("The generator needs the recorded jaw orientation in scene/grasp_goal.json.")
-    joint_names = list(robot.joint_names)
-    if joint_names != list(ARM_JOINT_NAMES):
-        raise RuntimeError(f"Expected the robot's joints to be {ARM_JOINT_NAMES}, got {joint_names}.")
+    if args.orientation == "vertical":
+        return vertical_jaw_quat_bag(goal.jaw_quat_bag)
+    return goal.jaw_quat_bag
 
-    env.reset()
-    pose = sample_bag_poses(n, args.x_half, args.y_half, math.radians(args.yaw_half_deg), device)
-    pose_w = pose.clone()
-    pose_w[:, :3] += env.scene.env_origins
-    bag.write_root_pose_to_sim_index(root_pose=pose_w, env_ids=driver.ids)
-    bag.write_root_velocity_to_sim_index(root_velocity=torch.zeros(n, 6, device=device), env_ids=driver.ids)
-    driver.trim.zero_()
 
-    home_cmd = robot.data.default_joint_pos.torch.clone()
-    home_cmd[:, 6] = GRIPPER_OPEN_POS
-    driver.hold(home_cmd, SETTLE_STEPS)
-    home_q, home_pose = driver.snapshot()
-
-    # Targets come from where the bag actually settled, in the world frame the kinematics use.
-    bag_pos_w, bag_quat_w = bag.data.root_pos_w.torch.clone(), bag.data.root_quat_w.torch.clone()
-    jaw_quat_bag = goal.jaw_quat_bag if args.orientation == "recorded" else vertical_jaw_quat_bag(goal.jaw_quat_bag)
-    grasp_pos, pregrasp_pos, wrist_quat = wrist_targets(
-        bag_pos_w, bag_quat_w, goal.tip_pos_bag, jaw_quat_bag, args.pregrasp_backoff
-    )
+def _recorded_joints(robot, goal) -> torch.Tensor:
     recorded = robot.data.default_joint_pos.torch.clone()
+    names = list(robot.joint_names)
     for name, value in goal.arm_joints.items():
-        if name in joint_names:
-            recorded[:, joint_names.index(name)] = value
+        if name in names:
+            recorded[:, names.index(name)] = value
     recorded[:, 6] = GRIPPER_OPEN_POS
+    return recorded
 
-    def tip_error() -> torch.Tensor:
-        """Distance [m] from the rigid-jaw tip to the recorded pinch point on the bag as it lies now."""
-        return (tip_pos_w(env) - strap_target_w(env)).norm(dim=-1)
 
-    home_tip_err = tip_error()
-    ik.write(recorded)  # does the recorded pose, put at the recorded joints, really put the tip on the strap?
-    seed_tip_err = tip_error()
-    if float(seed_tip_err.median()) > MAX_SEED_TIP_ERROR:
-        raise RuntimeError(
-            f"The recorded joints leave the tip {1e3 * float(seed_tip_err.median()):.0f} mm from the recorded pinch."
-            " The arm is mounted differently from when grasp_goal.json was recorded (check the arm base rotation),"
-            " or the recording is stale; inverse kinematics cannot fix that."
-        )
-    seed_tip = tip_pos_w(env)[0] - env.scene.env_origins[0]
-    ik_started = time.perf_counter()
-    rot_tol = math.radians(args.ik_rotation_tolerance_deg)
-    ik_options = dict(
+def _ik_options(args: argparse.Namespace) -> dict:
+    return dict(
         seeds=args.ik_seeds,
         noise_std=args.ik_noise_std,
         iterations=args.ik_iterations,
-        rot_tol=rot_tol,
+        rot_tol=math.radians(args.ik_rotation_tolerance_deg),
         margin=args.ik_joint_margin,
     )
-    # The vial generator's order: the overhead pose first, then the grasp. The overhead (our pregrasp, backed off along
-    # the insert axis) starts from the recorded joints and takes a random valid solution, which is what spreads the
-    # arm configurations in the dataset. The grasp then reuses the orientation the overhead solution actually
-    # achieved and starts from its joints, so both sit on one IK branch. Like the vial's intermediate waypoint the
-    # overhead only needs 1.5 cm, since the arm then moves on to the grasp.
-    q_pregrasp, pregrasp_ik, pregrasp_info = ik.solve(
-        pregrasp_pos,
-        wrist_quat,
-        recorded,
-        pos_tol=PREGRASP_POSITION_TOLERANCE,
-        randomize=True,
-        **ik_options,
-    )
-    ik_history = list(ik.history)
-    q_grasp, grasp_ik, grasp_info = ik.solve(
-        grasp_pos, pregrasp_info["quat"], q_pregrasp, pos_tol=args.ik_position_tolerance, **ik_options
-    )
-    ik_tip = tip_pos_w(env)[0] - env.scene.env_origins[0]
-    grasp_ok, pregrasp_ok = grasp_ik.valid, pregrasp_ik.valid
-    ik_seconds = time.perf_counter() - ik_started
-    ik.write(home_q)  # IK moved the arm instantly; put it back before any physics runs
-    robot.actuators.target_command.set_position_index(value=home_q, joint_ids=None, env_ids=driver.ids)
 
-    origin = env.scene.env_origins[0]
-    base = robot.data.root_pos_w.torch[0] - origin
+
+def _targets(driver: Driver, goal, args: argparse.Namespace):
+    """Wrist targets for the bag where it lies now, in the world frame."""
+    pos = driver.bag.data.root_pos_w.torch
+    quat = driver.bag.data.root_quat_w.torch
+    return wrist_targets(pos, quat, goal.tip_pos_bag, _jaw_quat(goal, args), args.pregrasp_backoff)
+
+
+def _held_grasp_target(driver: Driver, ik: WristIK, goal, args: argparse.Namespace):
+    """Wrist position that puts the tip on the pinch with the orientation the wrist holds now, and that orientation.
+
+    The pregrasp may only reach the recorded orientation within the IK tolerance. Keeping the tip on the pinch with
+    the orientation actually held stops the 10 cm tip offset turning that tolerance into a centimetre-scale miss.
+    """
+    grasp_pos, _pregrasp_pos, wrist_quat = _targets(driver, goal, args)
+    achieved = driver.robot.data.body_quat_w.torch[:, ik.ee].clone()
+    tip_offset = grasp_pos.new_tensor(EE_TIP_OFFSET).expand_as(grasp_pos)
+    return grasp_pos + quat_apply(wrist_quat, tip_offset) - quat_apply(achieved, tip_offset), achieved
+
+
+def _tip_error(env) -> torch.Tensor:
+    return (tip_pos_w(env) - strap_target_w(env)).norm(dim=-1)
+
+
+def _check_recording(
+    env, driver: Driver, ik: WristIK, goal, home_q: torch.Tensor, home_pose: torch.Tensor
+) -> torch.Tensor:
+    """Refuse to continue when the recorded joints no longer put the tip on the recorded pinch."""
+    ik.write(_recorded_joints(driver.robot, goal))
+    err = _tip_error(env)
+    seed_tip = tip_pos_w(env)[0] - env.scene.env_origins[0]
     fmt = lambda v: "(" + ", ".join(f"{float(x):.3f}" for x in v) + ")"  # noqa: E731
-    print(f"[generator]   env0 [m, env frame] arm base {fmt(base)}, bag {fmt(bag_pos_w[0] - origin)}")
-    print(f"[generator]   env0 strap target tip {fmt(strap_target_w(env)[0] - origin)}")
-    print(f"[generator]   env0 wrist target {fmt(grasp_pos[0] - origin)}")
-    print(f"[generator]   env0 tip at recorded joints {fmt(seed_tip)}, tip after IK {fmt(ik_tip)}")
-    history = [round(e, 3) for e in ik_history[::10]]
-    print(f"[generator]   IK median position error [m] by iteration, unperturbed start: {history}")
-    print(
-        f"[generator]   IK took {ik_seconds:.1f} s for {args.ik_seeds} starts x {args.ik_iterations} iterations x 2 poses"
-    )
-    driver.begin_monitoring()
-    driver.move(q_pregrasp)
-    pregrasp_q, pregrasp_pose = driver.snapshot()
-    pregrasp_tip_err = tip_error()
-    driver.move(q_grasp)
-    grasp_q, grasp_pose = driver.snapshot()
-    grasp_tip_err = tip_error()
-    driver.close_jaw(q_grasp)
-    closed_q, closed_pose = driver.snapshot()
+    print(f"[generator]   env0 tip at recorded joints {fmt(seed_tip)}")
+    if float(err.median()) > MAX_SEED_TIP_ERROR:
+        raise RuntimeError(
+            f"The recorded joints leave the tip {1e3 * float(err.median()):.0f} mm from the recorded pinch."
+            " The arm is mounted differently from when grasp_goal.json was recorded (check the arm base rotation),"
+            " or the recording is stale; inverse kinematics cannot fix that."
+        )
+    driver.restore(home_q, home_pose, HOLD_STEPS)
+    return err
 
-    shift = (closed_pose[:, :2] - home_pose[:, :2]).norm(dim=-1)
-    lift = closed_pose[:, 2] - home_pose[:, 2]
-    speed = bag.data.root_lin_vel_w.torch.norm(dim=-1)
-    rigid_on, moving_on = strap_contacts(env)
-    stats = {
-        "home_tip_err_mm": 1e3 * home_tip_err,
-        "seed_tip_err_mm": 1e3 * seed_tip_err,
-        "ik_best_pos_err_mm": 1e3 * grasp_info["best_pos_err"],
-        "ik_pos_err_mm": 1e3 * grasp_info["pos_err"],
-        "ik_rot_err_rad": grasp_info["rot_err"],
-        "ik_valid_starts": grasp_ik.valid_count.float(),
-        "ik_joint_delta_rad": grasp_ik.delta,
-        "ik_joint_margin_rad": grasp_ik.clearance,
-        "pregrasp_ik_best_pos_err_mm": 1e3 * pregrasp_info["best_pos_err"],
-        "pregrasp_ik_rot_err_rad": pregrasp_info["rot_err"],
-        "pregrasp_ik_valid_starts": pregrasp_ik.valid_count.float(),
-        "pregrasp_ik_joint_margin_rad": pregrasp_ik.clearance,
-        "track_err_rad": (grasp_q - q_grasp)[:, :6].abs().amax(dim=-1),
-        "pregrasp_tip_err_mm": 1e3 * pregrasp_tip_err,
-        "grasp_tip_err_mm": 1e3 * grasp_tip_err,
-        "closed_tip_err_mm": 1e3 * tip_error(),
+
+def _parked(pose: torch.Tensor) -> torch.Tensor:
+    parked = pose.clone()
+    parked[:, 2] = PARK_HEIGHT
+    return parked
+
+
+def _motion_stats(env, driver: Driver, pose: torch.Tensor, reference: torch.Tensor) -> dict[str, torch.Tensor]:
+    shift = (pose[:, :2] - reference[:, :2]).norm(dim=-1)
+    lift = pose[:, 2] - reference[:, 2]
+    speed = driver.bag.data.root_lin_vel_w.torch.norm(dim=-1)
+    grasp = strap_grasp(env)
+    return {
         "peak_lower_force_n": driver.peak_lower_force,
         "bag_shift_mm": 1e3 * shift,
         "bag_lift_mm": 1e3 * lift,
         "bag_speed_mps": speed,
         "jaw_pos_rad": gripper_joint_pos(env),
         "jaw_closed": gripper_closed(env).float(),
-        "rigid_jaw_on_strap": rigid_on.float(),
-        "moving_jaw_on_strap": moving_on.float(),
+        "strap_through_mouth": grasp.through.float(),
+        "strap_back_dist_mm": 1e3 * grasp.back_dist,
         "holding_streak": driver.streak.float(),
     }
-    checks = (
-        ("ik_grasp_failed", ~grasp_ok),
-        ("ik_pregrasp_failed", ~pregrasp_ok),
-        ("lower_body_contact", driver.peak_lower_force > args.max_lower_force),
-        ("bag_moved", shift > args.max_bag_shift),
-        ("bag_lifted", lift > MAX_BAG_LIFT),
-        ("not_holding", driver.streak < HOLDING_STREAK),
-        ("bag_still_moving", speed > MAX_BAG_SPEED),
-    )
-    accepted = torch.ones(n, dtype=torch.bool, device=device)
-    rejected: Counter = Counter()
-    for name, bad in checks:
-        newly = accepted & bad
-        rejected[name] += int(newly.sum())
-        accepted &= ~bad
 
-    rows = {
-        HOME: (home_q, home_pose),
-        PREGRASP: (pregrasp_q, pregrasp_pose),
-        GRASP: (grasp_q, grasp_pose),
-        GRASP_CLOSED: (closed_q, closed_pose),
-    }
-    kept = {phase: (q[accepted].cpu(), p[accepted].cpu()) for phase, (q, p) in rows.items()}
-    return kept, rejected, stats
+
+def _print_batch(phase: str, batch: int, accepted: int, total: int, goal: int, why: Counter, stats: dict) -> None:
+    print(f"[generator] {phase} batch {batch + 1}: accepted {accepted} ({total}/{goal})")
+    print(f"[generator]   rejected: {dict(why)}")
+    print("[generator]   median [min..max] over the batch:")
+    for name, values in stats.items():
+        low, mid, high = float(values.min()), float(values.median()), float(values.max())
+        print(f"[generator]     {name:22s} {mid:9.3f} [{low:.3f}..{high:.3f}]")
+
+
+def collect_home(env, driver: Driver, ik: WristIK, args, goal, checked: list[bool]):
+    """Settle the arm at home, then place the bag and let it settle. That resting state is the home row."""
+    n, device = env.num_envs, env.device
+    env.reset()
+    driver.pin_bag(None)
+    names = list(driver.robot.joint_names)
+    if names != list(ARM_JOINT_NAMES):
+        raise RuntimeError(f"Expected the robot's joints to be {ARM_JOINT_NAMES}, got {names}.")
+    home_cmd = driver.robot.data.default_joint_pos.torch.clone()
+    home_cmd[:, 6] = GRIPPER_OPEN_POS
+    driver.trim.zero_()
+    driver.hold(home_cmd, SETTLE_STEPS)
+    driver.write_bag(sample_bag_poses(n, args.x_half, args.y_half, math.radians(args.yaw_half_deg), device))
+    driver.hold(home_cmd, SETTLE_STEPS)
+    home_q, home_pose = driver.snapshot()
+    if not checked[0]:
+        checked[0] = True
+        err = _check_recording(env, driver, ik, goal, home_q, home_pose)
+        home_q, home_pose = driver.snapshot()
+    else:
+        err = _tip_error(env)
+    speed = driver.bag.data.root_lin_vel_w.torch.norm(dim=-1)
+    resting = (speed > MAX_BAG_SPEED) | (home_pose[:, 2] < BAG_REST_Z - 0.02)
+    accepted, rejected = _gate((("bag_not_resting", resting),))
+    stats = {"seed_tip_err_mm": 1e3 * err, "bag_speed_mps": speed, "bag_z_mm": 1e3 * home_pose[:, 2]}
+    return home_q[accepted], home_pose[accepted], accepted, rejected, stats
+
+
+def collect_pregrasp(env, driver: Driver, ik: WristIK, args, goal, bank: _Bank, child: _Bank):
+    """Sweep home to the pregrasp with the bag pinned away, then put the bag back."""
+    env.reset()
+    q, pose, attempt = bank.sample(env.num_envs, env.device, child)
+    driver.restore(q, pose, SETTLE_STEPS)
+    settled_q, settled_pose = driver.snapshot()
+    _grasp_pos, pregrasp_pos, wrist_quat = _targets(driver, goal, args)
+    started = time.perf_counter()
+    q_pre, choice, info = ik.solve(
+        pregrasp_pos,
+        wrist_quat,
+        _recorded_joints(driver.robot, goal),
+        pos_tol=PREGRASP_POSITION_TOLERANCE,
+        randomize=True,
+        **_ik_options(args),
+    )
+    history = [round(e, 3) for e in ik.history[::10]]
+    print(f"[generator]   IK median position error [m] by iteration, unperturbed start: {history}")
+    print(f"[generator]   pregrasp IK took {time.perf_counter() - started:.1f} s")
+    ik.write(settled_q)
+    driver.robot.actuators.target_command.set_position_index(value=settled_q, joint_ids=None, env_ids=driver.ids)
+    driver.pin_bag(_parked(settled_pose))
+    driver.move(q_pre, settle_steps=0)
+    driver.pin_bag(None)
+    driver.write_bag(settled_pose)
+    driver.begin_monitoring()
+    driver.hold(q_pre, HOLD_STEPS)
+    snap_q, snap_pose = driver.snapshot()
+    tip_err = _tip_error(env)
+    stats = _motion_stats(env, driver, snap_pose, settled_pose)
+    stats.update(
+        {
+            "pregrasp_tip_err_mm": 1e3 * tip_err,
+            "pregrasp_ik_best_pos_err_mm": 1e3 * info["best_pos_err"],
+            "pregrasp_ik_rot_err_rad": info["rot_err"],
+            "pregrasp_ik_valid_starts": choice.valid_count.float(),
+            "pregrasp_ik_joint_margin_rad": choice.clearance,
+        }
+    )
+    shift = stats["bag_shift_mm"] / 1e3
+    accepted, rejected = _gate(
+        (
+            ("ik_pregrasp_failed", ~choice.valid),
+            ("lower_body_contact", driver.peak_lower_force > args.max_lower_force),
+            ("bag_moved", shift > args.max_bag_shift),
+            ("bag_still_moving", stats["bag_speed_mps"] > MAX_BAG_SPEED),
+        )
+    )
+    return snap_q[accepted], snap_pose[accepted], attempt[accepted], rejected, stats
+
+
+def collect_grasp(env, driver: Driver, ik: WristIK, args, goal, bank: _Bank, child: _Bank):
+    """Move from a validated pregrasp onto the recorded pinch, jaw still open, bag in the tray."""
+    env.reset()
+    q, pose, attempt = bank.sample(env.num_envs, env.device, child)
+    driver.restore(q, pose, HOLD_STEPS)
+    settled_q, settled_pose = driver.snapshot()
+    grasp_pos, achieved = _held_grasp_target(driver, ik, goal, args)
+    started = time.perf_counter()
+    q_grasp, choice, info = ik.solve(
+        grasp_pos, achieved, settled_q, pos_tol=args.ik_position_tolerance, **_ik_options(args)
+    )
+    print(f"[generator]   grasp IK took {time.perf_counter() - started:.1f} s")
+    ik.write(settled_q)
+    driver.write_bag(settled_pose)
+    driver.robot.actuators.target_command.set_position_index(value=settled_q, joint_ids=None, env_ids=driver.ids)
+    driver.begin_monitoring()
+    driver.move(q_grasp)
+    snap_q, snap_pose = driver.snapshot()
+    tip_err = _tip_error(env)
+    stats = _motion_stats(env, driver, snap_pose, settled_pose)
+    stats.update(
+        {
+            "grasp_tip_err_mm": 1e3 * tip_err,
+            "ik_best_pos_err_mm": 1e3 * info["best_pos_err"],
+            "ik_pos_err_mm": 1e3 * info["pos_err"],
+            "ik_rot_err_rad": info["rot_err"],
+            "ik_valid_starts": choice.valid_count.float(),
+            "ik_joint_delta_rad": choice.delta,
+            "ik_joint_margin_rad": choice.clearance,
+            "track_err_rad": (snap_q - q_grasp)[:, :6].abs().amax(dim=-1),
+        }
+    )
+    shift = stats["bag_shift_mm"] / 1e3
+    accepted, rejected = _gate(
+        (
+            ("ik_grasp_failed", ~choice.valid),
+            ("lower_body_contact", driver.peak_lower_force > args.max_lower_force),
+            ("bag_moved", shift > args.max_bag_shift),
+            ("bag_still_moving", stats["bag_speed_mps"] > MAX_BAG_SPEED),
+        )
+    )
+    return snap_q[accepted], snap_pose[accepted], attempt[accepted], rejected, stats
+
+
+def collect_grasp_closing(env, driver: Driver, ik: WristIK, args, goal, bank: _Bank, child: _Bank):
+    """From a validated open-jaw grasp, slide the jaw ``args.close_insert`` further onto the strap and close it to
+    :data:`CLOSING_JAW_POS`: that state is the row. Then finish the close, and keep the row only if it holds.
+
+    The open-jaw grasp leaves the strap at the jaw tips, about 70 mm in front of the hinge and past the 65 mm front of
+    the closed mouth, so a jaw closed there pinches the strap at the tips or misses it. The row is recorded before
+    :func:`~..mdp.task.holding` can be true, so the policy still has to make the grasp.
+    """
+    env.reset()
+    q, pose, attempt = bank.sample(env.num_envs, env.device, child)
+    driver.restore(q, pose, HOLD_STEPS)
+    settled_q, settled_pose = driver.snapshot()
+    grasp_pos, achieved = _held_grasp_target(driver, ik, goal, args)
+    insert = quat_apply(achieved, grasp_pos.new_tensor(JAW_INSERT_AXIS).expand_as(grasp_pos))
+    q_deep, choice, _info = ik.solve(
+        grasp_pos + args.close_insert * insert,
+        achieved,
+        settled_q,
+        pos_tol=args.ik_position_tolerance,
+        **_ik_options(args),
+    )
+    ik.write(settled_q)
+    driver.write_bag(settled_pose)
+    driver.robot.actuators.target_command.set_position_index(value=settled_q, joint_ids=None, env_ids=driver.ids)
+    driver.begin_monitoring()
+    driver.move(q_deep)
+    q_part = q_deep.clone()
+    q_part[:, 6] = CLOSING_JAW_POS
+    driver.move(q_part, settle_steps=CLOSING_SETTLE_STEPS)
+    snap_q, snap_pose = driver.snapshot()
+    stats = _motion_stats(env, driver, snap_pose, settled_pose)
+    already_holding = holding(env)
+    q_closed = q_part.clone()
+    q_closed[:, 6] = GRIPPER_CLOSED_POS
+    driver.hold(q_closed, CLOSE_STEPS)
+    stats["holding_streak_after_close"] = driver.streak.float()
+    shift = stats["bag_shift_mm"] / 1e3
+    accepted, rejected = _gate(
+        (
+            ("ik_insert_failed", ~choice.valid),
+            ("already_holding", already_holding),
+            ("not_holding_after_close", driver.streak < HOLD_STEPS),
+            ("lower_body_contact", driver.peak_lower_force > args.max_lower_force),
+            ("bag_moved", shift > args.max_bag_shift),
+            ("bag_still_moving", stats["bag_speed_mps"] > MAX_BAG_SPEED),
+        )
+    )
+    return snap_q[accepted], snap_pose[accepted], attempt[accepted], rejected, stats
 
 
 def generate(env, args: argparse.Namespace) -> ResetDataset:
-    """Run batches until ``args.attempts`` attempts are accepted, then build the dataset."""
+    """Fill each phase to ``args.attempts`` rows from the phase before it, then build the dataset.
+
+    Home is sampled on its own. Every later phase draws seeds from the rows the previous phase kept, so a grasp only
+    exists when the pregrasp before it did.
+    """
     from ..env_cfg import ARM_ACTION_SCALE, GRIPPER_ACTION_SCALE
 
     driver = Driver(env, ARM_ACTION_SCALE, GRIPPER_ACTION_SCALE)
     ik = WristIK(env, args.seed)
-
-    kept = {phase: ([], []) for phase in PHASES}
+    goal = load_grasp_goal()
+    banks = {phase: _Bank() for phase in PHASES}
+    parents = {PREGRASP: HOME, GRASP: PREGRASP, GRASP_CLOSING: GRASP}
     rejected: Counter = Counter()
-    accepted = tried = 0
-    empty_batches = 0
-    for batch in range(args.max_batches):
-        rows, why, stats = run_batch(env, driver, ik, args)
-        count = rows[HOME][0].shape[0]
-        for phase in PHASES:
-            kept[phase][0].append(rows[phase][0])
-            kept[phase][1].append(rows[phase][1])
-        accepted += count
-        tried += env.num_envs
-        rejected.update(why)
-        print(f"[generator] batch {batch + 1}: accepted {count}/{env.num_envs} ({accepted}/{args.attempts} total)")
-        print(f"[generator]   rejected: {dict(why)}")
-        print("[generator]   median [min..max] over the batch:")
-        for name, values in stats.items():
-            low, mid, high = float(values.min()), float(values.median()), float(values.max())
-            print(f"[generator]     {name:22s} {mid:9.3f} [{low:.3f}..{high:.3f}]")
-        if accepted >= args.attempts:
-            break
-        empty_batches = empty_batches + 1 if count == 0 else 0
-        if empty_batches >= 2:
-            print("[generator] two batches in a row accepted nothing; stopping so the numbers above can be read.")
-            break
-    print(f"[generator] rejected by reason: {dict(rejected)}")
-    if accepted == 0:
-        raise SystemExit("[generator] no attempt produced a physics-validated grasp; see the reasons above.")
-    if accepted < args.attempts:
-        print(f"[generator] WARNING: only {accepted} of the requested {args.attempts} attempts were accepted.")
+    tried = 0
+    checked = [False]
+    next_id = 0
 
-    keep = min(accepted, args.attempts)
-    joint_pos, bag_pose, phase_ids, attempt_ids = [], [], [], []
+    for phase in PHASES:
+        parent = parents.get(phase)
+        empty_batches = 0
+        for batch in range(args.max_batches):
+            if len(banks[phase]) >= args.attempts:
+                break
+            if parent is not None and len(banks[parent]) == 0:
+                print(f"[generator] {phase}: no {parent} rows to continue from.")
+                break
+            if phase == HOME:
+                q, pose, _mask, why, stats = collect_home(env, driver, ik, args, goal, checked)
+                attempt = torch.arange(next_id, next_id + q.shape[0])
+                next_id += q.shape[0]
+            else:
+                q, pose, attempt, why, stats = {
+                    PREGRASP: collect_pregrasp,
+                    GRASP: collect_grasp,
+                    GRASP_CLOSING: collect_grasp_closing,
+                }[phase](env, driver, ik, args, goal, banks[parent], banks[phase])
+            room = args.attempts - len(banks[phase])
+            added = banks[phase].add(q[:room], pose[:room], attempt[:room])
+            tried += env.num_envs
+            rejected.update(why)
+            _print_batch(phase, batch, added, len(banks[phase]), args.attempts, why, stats)
+            if len(banks[phase]) >= args.attempts:
+                break
+            empty_batches = empty_batches + 1 if added == 0 else 0
+            if empty_batches >= 2:
+                print(f"[generator] {phase}: two batches in a row accepted nothing; stopping this phase.")
+                break
+
+    print(f"[generator] rejected by reason: {dict(rejected)}")
+    missing = [phase for phase in PHASES if len(banks[phase]) == 0]
+    if missing:
+        raise SystemExit(f"[generator] no physics-validated rows for {missing}; see the reasons above.")
+    short = [phase for phase in PHASES if len(banks[phase]) < args.attempts]
+    if short:
+        counts = {phase: len(banks[phase]) for phase in PHASES}
+        print(f"[generator] WARNING: short of {args.attempts} rows per phase: {counts}")
+
+    joint_pos, bag_state, phase_ids, attempt_ids = [], [], [], []
     for index, phase in enumerate(PHASES):
-        q = torch.cat(kept[phase][0])[:keep]
-        pose = torch.cat(kept[phase][1])[:keep]
+        q, state, attempt = banks[phase].stacked()
         joint_pos.append(q)
-        bag_pose.append(pose)
-        phase_ids.append(torch.full((keep,), index, dtype=torch.long))
-        attempt_ids.append(torch.arange(keep))
+        bag_state.append(state)
+        phase_ids.append(torch.full((q.shape[0],), index, dtype=torch.long))
+        attempt_ids.append(attempt.long())
     meta = {
         "joint_names": list(env.scene[ROBOT].joint_names),
-        "attempts": keep,
+        "rows_per_phase": {phase: len(banks[phase]) for phase in PHASES},
         "tried": tried,
         "rejected": dict(rejected),
         "x_half": args.x_half,
         "y_half": args.y_half,
         "yaw_half_deg": args.yaw_half_deg,
         "pregrasp_backoff": args.pregrasp_backoff,
+        "close_insert": args.close_insert,
         "max_lower_force": args.max_lower_force,
         "max_bag_shift": args.max_bag_shift,
         "orientation": args.orientation,
@@ -755,7 +987,11 @@ def generate(env, args: argparse.Namespace) -> ResetDataset:
         "ik_joint_margin": args.ik_joint_margin,
         "seed": args.seed,
     }
-    return ResetDataset(torch.cat(phase_ids), torch.cat(attempt_ids), torch.cat(joint_pos), torch.cat(bag_pose), meta)
+    state = torch.cat(bag_state)
+    strap = state[:, 7:].reshape(state.shape[0], -1, 3)
+    return ResetDataset(
+        torch.cat(phase_ids), torch.cat(attempt_ids), torch.cat(joint_pos), state[:, :7].contiguous(), meta, strap
+    )
 
 
 def _parse_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[str]]:
@@ -764,7 +1000,7 @@ def _parse_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[str]]:
     from isaaclab_tasks.utils import setup_preset_cli
 
     parser = argparse.ArgumentParser(description="Generate the handle-grab reset dataset.")
-    parser.add_argument("--attempts", type=int, default=256, help="Accepted attempts to collect (four rows each).")
+    parser.add_argument("--attempts", type=int, default=128, help="Rows to collect for each phase.")
     parser.add_argument("--num_envs", type=int, default=128, help="Attempts scripted in parallel per batch.")
     parser.add_argument("--max_batches", type=int, default=40, help="Give up after this many batches.")
     parser.add_argument("--output", type=Path, default=DEFAULT_DATASET_PATH, help="Dataset file to write.")
@@ -772,6 +1008,9 @@ def _parse_args(argv: list[str] | None) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--y_half", type=float, default=0.04, help="Half-width of the bag spawn box in y [m].")
     parser.add_argument("--yaw_half_deg", type=float, default=20.0, help="Half-range of the bag heading [deg].")
     parser.add_argument("--pregrasp_backoff", type=float, default=0.06, help="Pregrasp distance from the pinch [m].")
+    parser.add_argument(
+        "--close_insert", type=float, default=0.015, help="Jaw slide onto the strap before a closing grasp [m]."
+    )
     parser.add_argument("--max_lower_force", type=float, default=3.0, help="Peak lower-body contact allowed [N].")
     parser.add_argument("--max_bag_shift", type=float, default=0.03, help="Bag displacement allowed [m].")
     parser.add_argument(
@@ -821,10 +1060,11 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with torch.inference_mode():
                 dataset = generate(env, args)
+            # Closing the app can end the process, so the dataset has to be on disk first.
+            dataset.save(args.output)
+            print(f"[generator] wrote {dataset.phase.shape[0]} rows to {args.output}", flush=True)
         finally:
             env.close()
-    dataset.save(args.output)
-    print(f"[generator] wrote {dataset.phase.shape[0]} rows to {args.output}")
     return 0
 
 

@@ -14,7 +14,7 @@ import torch
 
 from .curriculum import PHASES
 
-DATASET_VERSION = 1
+DATASET_VERSION = 4
 DEFAULT_DATASET_PATH = Path(__file__).with_name("handle_grab_reset_dataset.pt")
 """Written by :mod:`isaaclab_tasks.core.official_handle_grab.reset.generator`."""
 
@@ -35,10 +35,17 @@ class ResetDataset:
     """Bag root pose ``(x, y, z, qx, qy, qz, qw)`` in the environment frame. Shape ``(rows, 7)``."""
     meta: dict = field(default_factory=dict)
     """Free-form generator settings, kept for traceability."""
+    strap_nodes: torch.Tensor | None = None
+    """Deformable strap nodes in the bag frame [m]. Shape ``(rows, nodes, 3)``; zero nodes for the rigid strap, whose
+    shape is part of the bag. ``None`` is stored as zero nodes."""
     _rows: dict[str, torch.Tensor] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         rows = self.phase.shape[0]
+        if self.strap_nodes is None:
+            self.strap_nodes = torch.zeros(rows, 0, 3, device=self.bag_pose.device)
+        if self.strap_nodes.dim() != 3 or self.strap_nodes.shape[0] != rows or self.strap_nodes.shape[2] != 3:
+            raise ValueError(f"strap_nodes must have shape ({rows}, nodes, 3), got {tuple(self.strap_nodes.shape)}.")
         if self.attempt.shape != (rows,):
             raise ValueError(f"attempt must have shape ({rows},), got {tuple(self.attempt.shape)}.")
         if self.joint_pos.shape != (rows, NUM_JOINTS):
@@ -47,7 +54,8 @@ class ResetDataset:
             raise ValueError(f"bag_pose must have shape ({rows}, 7), got {tuple(self.bag_pose.shape)}.")
         if rows and (int(self.phase.min()) < 0 or int(self.phase.max()) >= len(PHASES)):
             raise ValueError(f"phase ids must lie in [0, {len(PHASES)}).")
-        if not torch.isfinite(self.joint_pos).all() or not torch.isfinite(self.bag_pose).all():
+        poses = (self.joint_pos, self.bag_pose, self.strap_nodes)
+        if not all(bool(torch.isfinite(t).all()) for t in poses):
             raise ValueError("The reset dataset contains non-finite poses.")
 
     def to(self, device: str | torch.device) -> ResetDataset:
@@ -57,6 +65,7 @@ class ResetDataset:
             self.joint_pos.to(device),
             self.bag_pose.to(device),
             self.meta,
+            self.strap_nodes.to(device),
         )
 
     def rows(self, phase: str) -> torch.Tensor:
@@ -77,6 +86,7 @@ class ResetDataset:
                 "attempt": self.attempt.cpu(),
                 "joint_pos": self.joint_pos.cpu(),
                 "bag_pose": self.bag_pose.cpu(),
+                "strap_nodes": self.strap_nodes.cpu(),
                 "meta": self.meta,
             },
             path,
@@ -96,7 +106,14 @@ class ResetDataset:
                 f"'{path}' has version {data.get('version')} and phases {data.get('phases')}; expected version"
                 f" {DATASET_VERSION} and phases {list(PHASES)}. Regenerate it."
             )
-        dataset = cls(data["phase"], data["attempt"], data["joint_pos"], data["bag_pose"], data.get("meta", {}))
+        dataset = cls(
+            data["phase"],
+            data["attempt"],
+            data["joint_pos"],
+            data["bag_pose"],
+            data.get("meta", {}),
+            data.get("strap_nodes"),
+        )
         return dataset.to(device)
 
 

@@ -7,11 +7,12 @@
 
 The scene is the one :class:`~isaaclab_tasks.core.official_handle_grab.scene.handle_grab_scene.HandleGrabSceneCfg`
 defines: an SO-101 over a tray, a rigid bag lying on its side, and a strap handle on the bag's top face. The task is
-to close the jaws on the strap and keep the bag held, lifted 1 cm, for five seconds.
+grasp-only for now: close the jaws on the strap and keep it in them for five seconds. Lifting the bag is shelved, see
+``LIFT_GRAVEYARD.md``.
 
 Compared with the direct task it replaces the demo-residual action with small relative joint steps, and the replayed
 teacher with dense shaping, latched milestones, and resets from a physics-validated dataset. ``presets=sim2real`` adds
-per-episode physical randomization; ``presets=pinch_only`` makes a held strap enough for success.
+per-episode physical randomization.
 """
 
 import math
@@ -28,21 +29,27 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
-from isaaclab_tasks.core.official_handle_grab.scene.handle_grab_scene import HandleGrabSceneCfg
+from isaaclab_tasks.core.official_handle_grab.scene.handle_grab_scene import USE_DEFORMABLE_HANDLE, HandleGrabSceneCfg
 from isaaclab_tasks.utils import preset
 
 from . import mdp
 from .mdp.task import ARM_JOINTS, EE_BODY_NAME, GRIPPER_JOINT, MOVING_JAW_BODY_NAME
-from .mdp.terminations import HOLD_SECONDS, LIFT_HEIGHT
-from .reset import ALL_PHASES, APPROACH_PHASES, CANONICAL_START, DEFAULT_DATASET_PATH
+from .mdp.terminations import HOLD_SECONDS
+from .reset import ALL_PHASES, CANONICAL_START, DEFAULT_DATASET_PATH
+from .reset.curriculum import GRASP_CLOSING
 
 ARM_ACTION_SCALE = 0.033
 """Largest arm joint step per policy step [rad], the vial task's value."""
-GRIPPER_ACTION_SCALE = 0.02
-"""Largest jaw step per policy step [rad]. Also bounds the squeeze: a stalled jaw is commanded 0.02 rad past itself."""
+GRIPPER_ACTION_SCALE = 0.04
+"""Largest jaw step per policy step [rad]. Also bounds the squeeze: a stalled jaw is commanded 0.04 rad past itself.
+
+Twice the vial's 0.02: this jaw travels 0.9 rad from open to holding, which at 0.02 took 45 full-scale steps in a row
+and was never found by exploration noise."""
 LOWER_BODY_FINAL_WEIGHT = -4.0
 LOWER_BODY_RAMP_STEPS = 16000
 """Environment steps over which the lower-body penalty grows to its full weight (about 250 PPO iterations)."""
+CLOSING_FADE_STEPS = 19200
+"""Environment steps over which ``grasp_closing`` starts fade from a quarter of the mix to none (300 PPO iterations)."""
 
 
 @configclass
@@ -97,7 +104,7 @@ class PolicyStateGroupCfg(ObsGroup):
 class CriticStateGroupCfg(PolicyStateGroupCfg):
     """Privileged training critic inputs."""
 
-    contact = ObsTerm(func=mdp.jaw_contact_flags)
+    lower_body_force = ObsTerm(func=mdp.lower_body_force_feature)
 
 
 @configclass
@@ -125,6 +132,7 @@ def _material_event(asset_cfg: SceneEntityCfg, static: tuple[float, float], dyna
 class EventsCfg:
     """Task-horizon resets from the physics-validated dataset plus the direct task's bag grip and servo variation."""
 
+    strap_attachment = EventTerm(func=mdp.attach_strap, mode="prestartup") if USE_DEFORMABLE_HANDLE else None
     bag_friction = _material_event(SceneEntityCfg("bag", body_names=".*"), (0.5, 1.2), (0.4, 1.0))
     arm_gains = EventTerm(
         func=mdp.randomize_actuator_gains,
@@ -143,8 +151,7 @@ class EventsCfg:
         params={
             "dataset_path": str(DEFAULT_DATASET_PATH),
             "sequential": False,
-            # pinch_only starts only before the grasp: a closed-grasp start is already a held strap.
-            "phase_weights": preset(default=ALL_PHASES, pinch_only=APPROACH_PHASES),
+            "phase_weights": ALL_PHASES,
             "home_position_noise": 0.005,
             "home_heading_noise": math.radians(3.0),
         },
@@ -194,14 +201,19 @@ class Sim2RealEventsCfg(EventsCfg):
 
 @configclass
 class RewardsCfg:
-    """Dense approach and hold shaping, sparse milestones, a success bonus, two penalties, and light regularization."""
+    """Dense approach, jaw-closing, hold and grasp-placement shaping, sparse milestones, a success bonus, two
+    penalties, and light regularization."""
 
     approach_progress = RewTerm(func=mdp.approach_progress, weight=1.0)
-    held_goal = RewTerm(func=mdp.held_goal, weight=0.1, params={"require_lift": preset(default=True, pinch_only=False)})
-    # Grasp and lift, 1:2. pinch_only drops the lift milestone along with the lift requirement.
-    milestones = RewTerm(
-        func=mdp.milestones, weight=10.0, params={"weights": preset(default=(1.0, 2.0), pinch_only=(1.0, 0.0))}
-    )
+    # Bridges reaching the strap and holding it: nothing else pays for the 0.9 rad close.
+    jaw_closing = RewTerm(func=mdp.jaw_closing, weight=10.0, params={"std": 0.02})
+    # The grasp itself (held_goal, milestones) out-pays every shaping and placement term; only the success bonus,
+    # which is five seconds of the same grasp, is larger.
+    held_goal = RewTerm(func=mdp.held_goal, weight=0.2)
+    # While holding: a grasp near the top of the strap's arch, and a strap deep in the jaws, pay more.
+    grasp_centered = RewTerm(func=mdp.grasp_centered, weight=0.1)
+    strap_depth = RewTerm(func=mdp.strap_depth, weight=0.05, params={"std": 0.02})
+    milestones = RewTerm(func=mdp.milestones, weight=20.0)
     success = RewTerm(func=mdp.success, weight=200.0)
     bag_lost = RewTerm(
         func=mdp.is_terminated_term, weight=-50.0, params={"term_keys": ["bag_out_of_bounds", "bag_dropped"]}
@@ -219,14 +231,7 @@ class RewardsCfg:
 @configclass
 class TerminationsCfg:
     # Listed first: it updates the milestones that bag_dropped reads.
-    success = DoneTerm(
-        func=mdp.grab_success,
-        params={
-            "lift_height": LIFT_HEIGHT,
-            "hold_s": HOLD_SECONDS,
-            "require_lift": preset(default=True, pinch_only=False),
-        },
-    )
+    success = DoneTerm(func=mdp.grab_success, params={"hold_s": HOLD_SECONDS})
     bag_dropped = DoneTerm(func=mdp.bag_dropped)
     # Tray inner walls are x +-0.30 and y -0.12..0.30 about the environment origin, plus a margin.
     bag_out_of_bounds = DoneTerm(
@@ -250,6 +255,12 @@ class CurriculumCfg:
             "modify_params": {"final_weight": LOWER_BODY_FINAL_WEIGHT, "ramp_steps": LOWER_BODY_RAMP_STEPS},
         },
     )
+    # The nearly closed starts teach the last part of the close; later in training every grasp starts further out.
+    reset_fade = CurrTerm(
+        func=mdp.fade_reset_phase,
+        params={"phase": GRASP_CLOSING, "start_weight": 1.0, "final_weight": 0.0, "fade_steps": CLOSING_FADE_STEPS},
+    )
+    success_by_start = CurrTerm(func=mdp.success_by_start, params={"window": 200})
 
 
 @configclass
@@ -265,14 +276,16 @@ class HandleGrabEnvCfg(ManagerBasedRLEnvCfg):
     curriculum: CurriculumCfg = CurriculumCfg()
 
     def __post_init__(self):
-        # Physics 60 Hz, policy 30 Hz. The arm's 0.5 rad/s speed limit moves the tip under a millimetre per physics
-        # step, inside the contact skin; 120 Hz with 4 substeps did twice the solver work for the same policy rate.
+        # Physics 60 Hz, policy 30 Hz. At the commanded joint speeds (0.5 rad/s or less) the tip moves under a
+        # millimetre per physics step, inside the contact skin; 120 Hz with 4 substeps did twice the solver work for
+        # the same policy rate.
         self.decimation = 2
         self.episode_length_s = 20.0
         self.is_finite_horizon = False
         self.sim.dt = 1.0 / 60.0
         self.sim.render_interval = self.decimation
-        self.sim.physics = PhysxCfg()
+        # Deformable contacts overflow the default found/lost pair buffer.
+        self.sim.physics = PhysxCfg(gpu_found_lost_pairs_capacity=2**22) if USE_DEFORMABLE_HANDLE else PhysxCfg()
 
     def play_mode(self):
         """Play and evaluate complete episodes from the home pose, in dataset order.

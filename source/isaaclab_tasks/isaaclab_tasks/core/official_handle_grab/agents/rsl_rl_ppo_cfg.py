@@ -50,16 +50,16 @@ class HandleGrabStatePPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 @configclass
 class HandleGrabCameraPPORunnerCfg(HandleGrabStatePPORunnerCfg):
-    """Overhead-camera policy trained from scratch: RGB and proprioception actor, privileged state critic."""
+    """Overhead-camera policy trained from scratch: RGB, depth and proprioception actor, privileged state critic."""
 
     max_iterations = 2500
     save_interval = 100
     experiment_name = "handle_grab_camera"
-    obs_groups = {"actor": ["overhead_rgb", "proprioception"], "critic": ["critic"]}
+    obs_groups = {"actor": ["overhead_rgb", "overhead_depth", "proprioception"], "critic": ["critic"]}
     actor = RslRlCNNModelCfg(
         # Same encoder as the distillation student.
         cnn_cfg=RslRlCNNModelCfg.CNNCfg(
-            output_channels=[16, 32, 32], kernel_size=[5, 3, 3], stride=[2, 2, 2], activation="elu"
+            output_channels=[16, 32, 32, 32], kernel_size=[5, 3, 3, 3], stride=[2, 2, 2, 2], activation="elu"
         ),
         hidden_dims=[256, 128],
         activation="elu",

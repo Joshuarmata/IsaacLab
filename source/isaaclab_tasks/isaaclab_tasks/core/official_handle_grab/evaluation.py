@@ -5,9 +5,9 @@
 
 """Held-out evaluation of a handle-grab policy from the canonical home starts.
 
-Training mixes four reset phases, so its running success rate says little about the task the robot actually faces: start
-at home and grab the strap. This module runs complete episodes from home instead, with the bag walking through the
-dataset's home placements in order, and reports grasp, lift and success rates, why failed episodes ended, and the safety
+Training mixes three reset phases, so its running success rate says little about the task the robot actually faces:
+start at home and grab the strap. This module runs complete episodes from home instead, with the bag walking through the
+dataset's home placements in order, and reports grasp and success rates, why failed episodes ended, and the safety
 numbers. Build the environment from the play configuration, which makes the resets sequential and pins the physical
 parameters (``resolve_task_config(..., play_mode=True)``), and pass any callable mapping observations to actions::
 
@@ -30,11 +30,9 @@ class EvaluationSummary:
 
     episodes: int
     success_rate: float
-    """The strap was held (and, unless ``pinch_only``, the bag lifted) for the full hold time."""
+    """The strap was held in the closed jaws for the full hold time."""
     grasp_rate: float
     """The strap was in the closed jaws long enough to latch the grasp milestone."""
-    lift_rate: float
-    """The bag was lifted while the jaws held the strap."""
     drop_rate: float
     """The episode ended because the strap left the jaws after a grasp."""
     out_of_bounds_rate: float
@@ -75,7 +73,7 @@ def evaluate(
     obs = env.reset()[0]
     finished = torch.zeros(num_envs, dtype=torch.long, device=base.device)
     records: dict[str, list[torch.Tensor]] = {
-        key: [] for key in ("grasped", "lifted", "success", "dropped", "bounds", "force", "time")
+        key: [] for key in ("grasped", "success", "dropped", "bounds", "force", "time")
     }
     for _ in range(budget):
         out = env.step(policy(obs))
@@ -86,8 +84,7 @@ def evaluate(
             progress = base._hg_terminal_progress[take]
             terms = base.termination_manager
             records["grasped"].append(progress[:, 0])
-            records["lifted"].append(progress[:, 1])
-            records["success"].append(progress[:, 2])
+            records["success"].append(progress[:, 1])
             records["dropped"].append(terms.get_term("bag_dropped")[take])
             records["bounds"].append(terms.get_term("bag_out_of_bounds")[take])
             records["force"].append(base._hg_terminal_max_lower_force[take])
@@ -104,7 +101,6 @@ def evaluate(
         episodes=int(success.numel()),
         success_rate=float(success.float().mean()),
         grasp_rate=float(cat["grasped"].float().mean()),
-        lift_rate=float(cat["lifted"].float().mean()),
         drop_rate=float(cat["dropped"].float().mean()),
         out_of_bounds_rate=float(cat["bounds"].float().mean()),
         mean_time_to_success_s=float(cat["time"][success].mean()) if bool(success.any()) else None,

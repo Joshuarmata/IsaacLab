@@ -6,8 +6,8 @@
 """Cycle a generated reset dataset in the viewer, without a policy.
 
 This is the handle-grab counterpart of the vial tutorial's ``view-so101-resets``. Every row of the dataset is written
-into the scene (arm joints and bag pose), held for a few steps, and the next row follows, one attempt at a time:
-home, pregrasp, grasp, grasp_closed. Use it after the generator to see what the policy will start from::
+into the scene (arm joints, bag pose and strap shape), held for a few steps, and the next row follows, one attempt at
+a time: home, pregrasp, grasp. Use it after the generator to see what the policy will start from::
 
     uv run python -m isaaclab_tasks.core.official_handle_grab.reset.viewer --viz kit --dataset /tmp/check.pt
 """
@@ -20,7 +20,7 @@ from pathlib import Path
 
 import torch
 
-from ..mdp.task import BAG, ROBOT
+from ..mdp.task import BAG, ROBOT, write_strap
 from .curriculum import PHASES
 from .dataset import DEFAULT_DATASET_PATH, ResetDataset
 from .generator import TASK, configure_env_cfg
@@ -100,6 +100,7 @@ def _cycle(env, dataset: ResetDataset, args: argparse.Namespace) -> None:
             robot.actuators.target_command.set_position_index(value=q, joint_ids=None, env_ids=ids)
             bag.write_root_pose_to_sim_index(root_pose=bag_pose, env_ids=ids)
             bag.write_root_velocity_to_sim_index(root_velocity=torch.zeros(1, 6, device=env.device), env_ids=ids)
+            write_strap(env, ids, bag_pose, dataset.strap_nodes[row : row + 1])
             driver.trim.zero_()
             print(f"[viewer] row={row} attempt={int(dataset.attempt[row])} phase={PHASES[int(dataset.phase[row])]}")
             driver.hold(q, args.steps_per_pose)

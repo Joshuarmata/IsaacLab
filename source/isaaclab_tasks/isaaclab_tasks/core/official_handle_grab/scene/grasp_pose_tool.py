@@ -31,7 +31,7 @@ Trajectory timing (top-level keys in the pose file):
                       others; the move lasts as long as the slowest joint. "default" covers joints you don't list.
                       A plain number instead of a dict means that speed for every joint. Joints without a speed
                       finish together with the move (--move_s when nothing is given). The motors are capped at
-                      28.6 deg/s, so a peak above that is reported and the arm will lag the command.
+                      286.5 deg/s, so a peak above that is reported and the arm will lag the command.
 
 Waypoints (each lists only the joints it changes; the rest are inherited from the previous waypoint):
   pregrasp      jaws open, a few cm away from the strap
@@ -76,7 +76,7 @@ import isaaclab_tasks  # noqa: E402, F401
 from isaaclab_tasks.utils import resolve_task_config, setup_preset_cli  # noqa: E402
 
 WAYPOINTS = ("pregrasp", "grasp", "grasp_closed", "lift")
-VEL_LIMIT_DEG = 28.6  # [deg/s] the arm motors are capped at 0.5 rad/s (handle_grab_scene.py joint_velocity_limit)
+VEL_LIMIT_DEG = 286.5  # [deg/s] the arm motors are capped at 5 rad/s (handle_grab_scene.py joint_velocity_limit)
 MIN_MOVE_S = 0.3
 
 
@@ -234,8 +234,7 @@ class GraspRig:
             strap_text = (
                 f"strap pinched {int(u._strap_count[0]):2d} nodes @ depth {float(u._strap_depth[0]):4.2f}, "
                 f"on rigid jaw {int(u._rest_count[0]):2d} nodes @ depth {float(u._rest_depth[0]):4.2f} "
-                f"(want pinched {u.cfg.mouth_mid_frac:.2f}+-{u.cfg.mouth_tol:.2f} OR resting <"
-                f"{u.cfg.mouth_mid_frac + u.cfg.mouth_tol:.2f}: {'OK' if bool(u._strap_midway[0]) else 'no'})"
+                f"| strap through closed-jaw gap {'OK' if bool(u._strap_midway[0]) else 'no'}"
             )
         print(
             f"[grasp_pose] {label:13s} tip in bag frame (x,y,z)=({rel[0]:+.3f},{rel[1]:+.3f},{rel[2]:+.3f}) m"
@@ -354,7 +353,7 @@ def _run_sequence(rig: GraspRig, poses: dict, args: argparse.Namespace) -> None:
         first_row = len(rig.log) if rig.log is not None else 0
         print(f"[grasp_pose] -> {name} ({stage_s:.1f} s) " + " | ".join(cells), flush=True)
         if any("!" in c for c in cells):
-            print("[grasp_pose]    '!' = above the 28.6 deg/s motor cap, that joint will lag the command.", flush=True)
+            print("[grasp_pose]    '!' = above the 286.5 deg/s motor cap, that joint will lag the command.", flush=True)
         ended = rig.move(prev, targets[name], torch.tensor(secs)) or rig.hold(args.hold_s)
         info = rig.status(name)
         if rig.log is not None and len(rig.log) > first_row:

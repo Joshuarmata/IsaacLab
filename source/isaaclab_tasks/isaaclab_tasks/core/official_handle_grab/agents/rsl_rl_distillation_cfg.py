@@ -38,12 +38,15 @@ class HandleGrabCameraDistillationRunnerCfg(RslRlDistillationRunnerCfg):
     save_interval = 100
     experiment_name = "handle_grab_camera_distillation"
     run_name = ""
-    obs_groups = {"student": ["overhead_rgb", "proprioception"], "teacher": ["teacher_state"]}
+    obs_groups = {
+        "student": ["overhead_rgb", "overhead_depth", "proprioception"],
+        "teacher": ["teacher_state"],
+    }
     clip_actions = 1.0
     student = RslRlCNNModelCfg(
-        # Compact encoder for the 160 x 90 overhead image.
+        # Compact encoder for the 256 x 144 overhead image; RGB and depth each get their own copy.
         cnn_cfg=RslRlCNNModelCfg.CNNCfg(
-            output_channels=[16, 32, 32], kernel_size=[5, 3, 3], stride=[2, 2, 2], activation="elu"
+            output_channels=[16, 32, 32, 32], kernel_size=[5, 3, 3, 3], stride=[2, 2, 2, 2], activation="elu"
         ),
         hidden_dims=[256, 128],
         activation="elu",
