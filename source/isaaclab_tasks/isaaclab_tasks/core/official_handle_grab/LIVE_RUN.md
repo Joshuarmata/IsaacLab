@@ -1,6 +1,17 @@
 # Live run on this machine (no Isaac Sim)
 
-Handoff for the other machine. This checkout is `bag-lift-stagger` at `cc190c4d1` on `github.com/Joshuarmata/IsaacLab`. The robot computer is this Pop!_OS box (`~/IsaacLab`). It should run the camera student without starting Isaac Sim. Read the issues below, apply the fixes, and push them back to this branch so this machine can pull and rerun.
+## Applied
+
+Published on `bag-lift-stagger`:
+
+- `handle_grab/agents/__init__.py` skips the camera-network registration when `rl_games` is not installed. `uv run python -m isaaclab_tasks.core.official_handle_grab.real.deploy` imports without `--extra rl-games`. Training with the extra still registers the network.
+- The README driver install is `uv pip install feetech-servo-sdk pyrealsense2 onnxruntime`.
+- `policy.onnx` and `policy.onnx.data` are committed at the path below. `policy.pt` and the teacher checkpoint are not.
+- `joint_map.json` is still not committed. Set `"verified": true` locally before `home`, as in the steps below.
+
+## Handoff
+
+Handoff for the other machine. The robot computer is the Pop!_OS box (`~/IsaacLab`). Pull `bag-lift-stagger` and rerun the commands below; the camera student does not start Isaac Sim. The issues further down are what failed before this push. The fixes are in "Applied".
 
 Run every command from the Isaac Lab root.
 

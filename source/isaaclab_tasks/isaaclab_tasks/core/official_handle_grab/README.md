@@ -21,6 +21,7 @@ A running log, newest first. Each entry says what changed, why, and where to rea
 
 | Date       | What we changed / fixed                                                                                                                                                                                                                                                                                         | Why                                                                                                                                                                                                                                           | Details                                                          |
 | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| 2026-11-10 | The trained student export is in the repo at `logs/rsl_rl/handle_grab_camera_distillation/2026-11-10_17-05-25/exported/` (`policy.onnx` and `policy.onnx.data`). `handle_grab/agents` skips registering its camera network when `rl_games` is not installed. The driver install includes `onnxruntime`. | The robot computer has no Isaac Sim training stack. Importing the tasks pulled in `rl_games`, and the exported weights were gitignored, so `deploy` could not start. | "Sim to real", `LIVE_RUN.md` |
 | 2026-11-10 | `real/`: the student on the physical arm without ROS. `calibrate` (joint map from a hand-posed home), `twin` (the sim arm mirrors the real one, real and simulated camera overlaid), `home`, and `deploy` (dry run unless `--execute`). `bridge.py` builds the policy inputs with the simulator's own image code. `check_bridge` compares them, and ONNX against `policy.pt`, with the env's. | The policy is a 30 Hz loop of camera frame + joint angles in, joint targets out; ROS adds nothing for one arm and one camera. Every sim/real mismatch (joint signs, zero offsets, crop, normalization, action scaling) is checked in code before the arm moves. | "Sim to real"                                                    |
 | 2026-11-10 | Camera task `presets=sim2real`: per-episode image augmentation (exposure, white balance, contrast, gamma, blur, noise) and D415-like depth error (scale, offset, noise growing with distance, dropout, holes at edges); camera pose jitter (2 cm, 3 degrees); light intensity, tint and direction; bag, strap, floor and wall colours re-drawn every 20 to 40 s. | The student had seen one look. The real camera, room light and objects will not match the render, so the student has to see enough variety that the real scene is just another sample.                                                       | "Sim to real"                                                    |
 | 2026-11-10 | Camera student sees depth as well as RGB: an `overhead_depth` group (two stacked frames, clipped at 1 m and scaled to [0, 1], about 4 mm of noise, 0 for no return as on the real D415) with its own CNN. The image is 256 x 144 (was 160 x 90), and each CNN has a fourth stride-2 layer.                       | Depth gives the jaw's and strap's height directly, which one RGB view can only guess. At 160 x 90 the strap was two or three pixels wide.                                                                                                     | "The overhead camera (student)"                                  |
@@ -504,8 +505,9 @@ targets out. `real/` runs that loop in plain Python with `pyrealsense2`, the Fee
 would only add a transport layer between one camera and one bus. Run every command below from the Isaac Lab root.
 
 The trained student is `logs/rsl_rl/handle_grab_camera_distillation/2026-11-10_17-05-25` (`exported/policy.onnx`, with
-`policy.onnx.data` beside it). The teacher it was distilled from is
-`logs/rsl_rl/handle_grab_state/2026-11-10_16-22-41/model_400.pt`.
+`policy.onnx.data` beside it). Both files are committed, so a checkout of this branch has them. The teacher it was
+distilled from is `logs/rsl_rl/handle_grab_state/2026-11-10_16-22-41/model_400.pt` (not committed; only needed to
+retrain).
 
 ### 1. Hardware
 
@@ -524,7 +526,7 @@ glare on the floor.
 ### 2. Drivers
 
 ```bash
-uv pip install feetech-servo-sdk pyrealsense2
+uv pip install feetech-servo-sdk pyrealsense2 onnxruntime
 ```
 
 ### 3. Retrain with `presets=sim2real` (recommended)
