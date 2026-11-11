@@ -199,7 +199,17 @@ class OnnxStudent:
     def __init__(self, path: str | Path, providers: list[str] | None = None):
         import onnxruntime as ort
 
-        self.session = ort.InferenceSession(str(path), providers=providers or ort.get_available_providers())
+        # The default pool spin-waits on every core after the first call. On a CPU-only machine that
+        # starves the image crop, and each step then takes longer than the 30 Hz budget.
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        self.session = ort.InferenceSession(
+            str(path), sess_options=options, providers=providers or ort.get_available_providers()
+        )
         names = tuple(i.name for i in self.session.get_inputs())
         if set(names) != set(self.INPUTS):
             raise ValueError(f"{path} takes {names}; the camera student takes {self.INPUTS}.")

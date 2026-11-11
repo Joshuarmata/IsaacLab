@@ -109,11 +109,22 @@ def run_episode(
         raise SystemExit(f"The arm is {off_home.max():.2f} rad from home (limit {START_TOLERANCE}); run home.py first.")
     # As after a simulator reset: targets at the measured pose, no previous action.
     last_target, last_action = pos.copy(), np.zeros_like(pos)
+    if verbose:
+        print("Warming up the student. The first image kernel can take a few seconds on CPU.", flush=True)
+    # Compile Warp and the ONNX session before the timed loop. The first CPU compile takes seconds
+    # and would otherwise be counted as a late step.
+    rgb, depth = camera.read()
+    warmup_frames = to_student_frames(rgb, depth, camera.intrinsics)
+    policy(builder(pos, np.zeros_like(pos), pos, np.zeros_like(pos), *warmup_frames))
+    builder.reset()
     blocked = overruns = 0
     start = clock()
     try:
-        while (now := clock()) - start < seconds:
+        while clock() - start < seconds:
             rgb, depth = camera.read()
+            # Time the work after the frame arrives. wait_for_frames blocks until the camera's own
+            # 30 Hz tick, and that wait is not a late step.
+            now = clock()
             pos = np.array(joint_map.to_rad(bus.read_positions()))
             vel = velocity(pos, now)
             frames = to_student_frames(rgb, depth, camera.intrinsics)

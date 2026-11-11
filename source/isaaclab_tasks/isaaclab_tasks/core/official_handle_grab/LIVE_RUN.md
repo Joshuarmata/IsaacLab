@@ -1,5 +1,26 @@
 # Live run on this machine (no Isaac Sim)
 
+## Stopped here, 2026-11-10
+
+The stack runs. The grasp does not. Pick this up next week from the sim-to-real gap, not from install or the control loop.
+
+What worked on this Pop!_OS box, from the Isaac Lab root:
+
+- Dry run of `real.deploy` completed 20 s and stopped with `time limit`. The student, the D415, and the servo bus all stayed up. There is no NVIDIA driver here. The CUDA line from Warp is expected. The CPU image kernels are cached.
+- `real.home` reached the simulated home. Error per joint [rad]: `[-0.003, -0.023, 0.037, 0.005, 0.006, 0.0, -0.003]`.
+- One live episode, `real.deploy --execute --log episode.npz`, ran until it was stopped by hand at 16.9 s (493 steps, median 34 ms, about 29 Hz). `episode.npz` is local only, at the repo root, and is not committed. The motors tracked the commands: mean absolute target error per joint was under 0.03 rad.
+
+What the live episode did, from that log. Joint order is `revolute_1` .. `revolute_7`, gripper last. Start pose was home. End pose was `[0.038, 2.406, -1.382, 0.644, -0.349, -1.238, -0.248]`. The large moves were joint 2 (+1.47 rad), joint 3 (+0.74 rad), joint 6 (-0.87 rad), and the gripper (0.60 rad down to -0.25 rad, a close). Several actions sat on the limit. The arm followed those commands. It did not perform the grasp.
+
+Open issue: sim to real. The policy is the committed student `logs/rsl_rl/handle_grab_camera_distillation/2026-11-10_17-05-25/exported/policy.onnx`. Likely setup, not the runtime:
+
+- The camera was never checked against the simulated view. `twin --viz kit` is the check, and it starts Isaac Sim, which this machine is not running. The student expects the D415 about 0.70 m above the tray, tilted about 12 degrees in from +x, within about 2 cm and 3 degrees.
+- Joint signs are still all `+1`. They were never checked in `twin`. Home happened to arrive, which does not prove a sign is right once the arm leaves that pose.
+- This student was not retrained with `presets=sim2real`. It has seen one rendered look. Room light, bag color, and the real arm's appearance can all throw it off.
+- `joint_map.json` is calibrated and `"verified": true` on this machine only. Do not commit it. This box has no `python` on `PATH`. Use `uv run python`.
+
+Also in this push: `deploy` compiles the image kernels before the timed loop, and the ONNX session uses one thread with spinning off. Without that, the CPU loop stopped in a few seconds with `loop too slow`.
+
 ## Applied
 
 Published on `bag-lift-stagger`:
